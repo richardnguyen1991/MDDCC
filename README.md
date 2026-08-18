@@ -20,7 +20,9 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 |---|---|---|
 | 1 | Tên repo/notebook/bucket/prefix, cây thư mục, `configs/mddcc.yaml` | ✅ xong |
 | 2a | Discovery Kaggle Dataset (`scripts/discover_dataset.py`) | ✅ xong — **cần chạy trên Kaggle để chốt số thật** |
-| 2b | `data.py`, `wavelet.py`, chống rò rỉ split, test SWT | ✅ xong — 35/35 test pass |
+| 2b | `data.py`, `wavelet.py`, chống rò rỉ split, loại cột, test SWT | ✅ xong |
+| 2c | `stage1_switch_stats.py` — công thức (1)(2)(3) + 3-sigma (§3.G) | ✅ xong — **ngoài phạm vi đánh giá** |
+| — | **Tổng test** | **54/54 pass** |
 | 3 | `model.py`, `train.py`, `checkpoint.py` (resume giữa epoch từ S3) | ⏳ chưa làm |
 | 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ⏳ chưa làm |
 | 5 | `kernel/`, `.github/workflows/run-kaggle.yml` | ⏳ chưa làm |
@@ -74,6 +76,8 @@ chi phí đo được 0,2 h/epoch, khoảng 5% so với 4,1 h compute.
 
 ## Hình học wavelet
 
+`F` là số cột **còn lại sau khi loại** (xem mục dưới), không phải số cột thô trong Parquet.
+
 ```
 F = 80 feature  ──pad reflect──>  F_swt = ceil(80/8)*8 = 80
                 ──pywt.swt(db4, level=3, axis=1)──>  4 subband × 80 (cùng độ dài chuỗi gốc)
@@ -89,6 +93,51 @@ Table 3 có 3 lần `MaxPool2d(2×2)`. Với `S = 9` và pooling mặc định (
 thắt cổ chai nghiêm trọng. Với `ceil_mode=True`: `9 → 5 → 3 → 2` → **128 chiều**.
 Đây là sai khác nhỏ nhất có thể so với bài báo (giữ nguyên công thức padding và
 Table 3, chỉ đổi chế độ làm tròn của pooling) và đã ghi vào `deviations_from_paper`.
+
+---
+
+## Quy tắc loại cột
+
+`feature_selection: none` — **không** chọn tập con theo độ quan trọng như bài báo (48/80).
+Chỉ loại những cột không mang thông tin hoặc gây rò rỉ, và mọi cột bị loại đều được ghi
+kèm lý do vào `preprocessing.json`:
+
+| Nhóm | Cột | Lý do |
+|---|---|---|
+| Định danh / rò rỉ | `Flow ID`, `Source IP`, `Destination IP`, `Timestamp`, `Unnamed: 0`, `SimillarHTTP` | giữ lại sẽ làm metric đẹp giả tạo |
+| Provenance | `__capture_day`, `__source_file_id`, `__source_row_id` | do bước chuyển Parquet thêm vào, không phải đặc trưng lưu lượng |
+| Thiếu > 80% | tính trên **tập train** | §3.C.1 |
+| Hằng số tuyệt đối | `min == max` trên train | không mang thông tin |
+| Trùng lặp | lọc ứng viên bằng chữ ký thống kê, rồi **đối chiếu giá trị thật** trên mẫu ≤ 50.000 hàng train | §3.B |
+
+Thứ tự bắt buộc: split → fit scaler trên train → **loại cột** → tính hình học wavelet →
+dựng cache. Loại cột diễn ra *sau* khi fit scaler vì cả ba tiêu chí đều phải tính chỉ trên
+tập train; Min-Max độc lập từng cột nên cắt bớt cột không làm sai thống kê, không cần fit lại.
+
+> Phát hiện trùng lặp được xác minh trên mẫu chứ không trên toàn bộ 70,4M hàng. Hai cột
+> giống hệt nhau trên 50.000 hàng train nhưng khác nhau ở phần còn lại sẽ bị bỏ sót —
+> đánh đổi có chủ ý để tránh một lượt quét toàn bộ dữ liệu.
+
+---
+
+## Giai đoạn 1 — ngoài phạm vi đánh giá
+
+`src/stage1_switch_stats.py` implement đúng công thức của bài báo:
+
+| | Công thức | Hướng khi bị tấn công |
+|---|---|---|
+| (1) | `R_Pi = N_FI / N_Pi` | giảm |
+| (2) | `R_FI = N_FO / N_FI` | giảm |
+| (3) | `ΔN_P = abs(N_PI − N_PO)` | tăng |
+
+Ngưỡng học từ **chỉ lưu lượng bình thường** (bài báo lấy 10.000 bộ mẫu):
+`R_Pi` và `R_FI` dùng `μ − 3σ`, `ΔN_P` dùng `μ + 3σ`. Bài báo yêu cầu **cả ba** cùng vượt
+ngưỡng mới kết luận có tấn công — phép AND, không phải OR; test đã khoá hành vi này.
+
+**Module không được chạy trên CIC-DDoS2019** và không được báo cáo như đã tái hiện đủ:
+dataset là dữ liệu luồng do CIC-FlowMeter trích xuất, không chứa `N_FI`, `N_FO`, `N_Pi`,
+`N_PI`, `N_PO`. Hàm `assert_not_applicable_to_cicddos2019()` chặn cứng mọi ý định đó.
+Tái hiện đầy đủ cần môi trường Mininet/POX, nằm ngoài phạm vi luận văn.
 
 ---
 

@@ -81,6 +81,18 @@ class FeatureSchema:
                 "Khong duoc am tham train lai tu dau."
             )
 
+    def pruned(self, keep_mask: np.ndarray, extra_dropped: list[dict]) -> "FeatureSchema":
+        """Tra ve schema moi sau khi loai cot hang so / trung lap / thieu qua nhieu."""
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+        if keep_mask.size != self.n_features:
+            raise ValueError(f"mask {keep_mask.size} != n_features {self.n_features}")
+        kept = [c for c, k in zip(self.feature_columns, keep_mask) if k]
+        if not kept:
+            raise RuntimeError("Loai het cot dac trung - kiem tra nguong trong config.")
+        return FeatureSchema(kept, self.label_column,
+                             self.dropped_columns + list(extra_dropped),
+                             self.label_detection)
+
 
 def discover_schema(files: Sequence[Path], cfg: dict) -> FeatureSchema:
     """Xac dinh cot nhan + cot dac trung. Fail-fast neu khong ro rang."""
@@ -379,6 +391,17 @@ class ScalerStats:
         np.clip(out, 0.0, 1.0, out=out)      # val/test co the vuot bien cua train
         return out.astype(np.float32, copy=False)
 
+    def subset(self, keep_mask: np.ndarray) -> "ScalerStats":
+        """Cat thong ke theo mask cot. Khong can fit lai: Min-Max doc lap tung cot."""
+        m = np.asarray(keep_mask, dtype=bool)
+        if m.size != len(self.columns):
+            raise ValueError(f"mask {m.size} != so cot {len(self.columns)}")
+        return ScalerStats(
+            [c for c, k in zip(self.columns, m) if k],
+            self.minimum[m], self.maximum[m], self.mean[m],
+            self.missing_ratio[m], self.n_nan[m], self.n_inf[m], self.n_train_rows,
+        )
+
     def to_dict(self) -> dict:
         return {
             "fit_on": "train_split_only",
@@ -428,6 +451,104 @@ def fit_scaler_on_train(files: Sequence[Path], row_counts: Sequence[int],
     if offset != train_mask_all.size:
         raise RuntimeError(f"Doc {offset} hang, mong doi {train_mask_all.size}")
     return stats.finalize(schema.feature_columns)
+
+
+# ------------------------------------------------- loai cot (muc 3.B, 3.C.1)
+@dataclass
+class ColumnSelection:
+    """Ket qua loai cot hang so / trung lap / thieu qua nhieu."""
+
+    keep_mask: np.ndarray
+    dropped: list[dict]
+
+    @property
+    def n_kept(self) -> int:
+        return int(self.keep_mask.sum())
+
+
+def read_train_sample(files: Sequence[Path], row_counts: Sequence[int],
+                      schema: FeatureSchema, splits: Splits,
+                      max_rows: int = 50_000) -> np.ndarray:
+    """Doc mot mau hang thuoc tap train de doi chieu cot trung lap.
+
+    Chi doc du max_rows roi dung - khong quet het 70.4M hang.
+    """
+    train_mask = np.zeros(int(sum(row_counts)), dtype=bool)
+    train_mask[splits.train] = True
+
+    chunks, taken, offset = [], 0, 0
+    for fp in files:
+        for block in iter_row_groups(fp, schema.feature_columns):
+            n = block.shape[0]
+            m = train_mask[offset:offset + n]
+            offset += n
+            if m.any():
+                sub = block[m][: max_rows - taken]
+                chunks.append(sub)
+                taken += sub.shape[0]
+                if taken >= max_rows:
+                    return np.vstack(chunks)
+    return np.vstack(chunks) if chunks else np.empty((0, schema.n_features))
+
+
+def select_columns(schema: FeatureSchema, scaler: ScalerStats, cfg: dict,
+                   sample: np.ndarray | None = None) -> ColumnSelection:
+    """Quyet dinh giu / loai tung cot dac trung. Ghi ly do cho tung cot bi loai.
+
+    Thu tu: thieu qua nguong -> hang so tuyet doi -> trung lap.
+    Khong dung 'do quan trong' de loai (muc 3.B: feature_selection=none);
+    chi loai cot khong mang thong tin hoac lap lai cot khac.
+    """
+    dcfg, pcfg = cfg["data"], cfg["preprocessing"]
+    n = schema.n_features
+    keep = np.ones(n, dtype=bool)
+    dropped: list[dict] = []
+
+    # 1. Thieu > nguong (muc 3.C.1). Ty le tinh tren tap train.
+    thr = pcfg["drop_column_if_missing_ratio_above"]
+    for i, name in enumerate(schema.feature_columns):
+        if scaler.missing_ratio[i] > thr:
+            keep[i] = False
+            dropped.append({"name": name, "reason": "missing_ratio_above_threshold",
+                            "missing_ratio": float(scaler.missing_ratio[i]),
+                            "threshold": thr})
+
+    # 2. Hang so tuyet doi (min == max tren train) - khong mang thong tin.
+    if dcfg.get("drop_constant_columns", True):
+        for i, name in enumerate(schema.feature_columns):
+            if keep[i] and scaler.constant_mask[i]:
+                keep[i] = False
+                dropped.append({"name": name, "reason": "constant_on_train",
+                                "value": float(scaler.minimum[i])})
+
+    # 3. Trung lap. Loc ung vien bang chu ky thong ke roi doi chieu that tren mau.
+    if dcfg.get("drop_duplicate_columns", True) and sample is not None and sample.size:
+        sig: dict[tuple, list[int]] = {}
+        for i in range(n):
+            if not keep[i]:
+                continue
+            key = (round(float(scaler.minimum[i]), 9), round(float(scaler.maximum[i]), 9),
+                   round(float(scaler.mean[i]), 9), int(scaler.n_nan[i]))
+            sig.setdefault(key, []).append(i)
+
+        for group in sig.values():
+            if len(group) < 2:
+                continue
+            keeper = group[0]
+            for j in group[1:]:
+                a, b = sample[:, keeper], sample[:, j]
+                same = np.array_equal(np.nan_to_num(a, nan=np.inf),
+                                      np.nan_to_num(b, nan=np.inf))
+                if same:
+                    keep[j] = False
+                    dropped.append({
+                        "name": schema.feature_columns[j],
+                        "reason": "duplicate_of",
+                        "duplicate_of": schema.feature_columns[keeper],
+                        "verified_on_rows": int(sample.shape[0]),
+                    })
+
+    return ColumnSelection(keep, dropped)
 
 
 def build_feature_cache(files: Sequence[Path], row_counts: Sequence[int],
@@ -603,7 +724,21 @@ def prepare_dataset(cfg: dict, out_dir: Path, *, files=None) -> PreparedData:
 
     splits = make_splits(labels, cfg, groups=groups)
     manifest = assert_no_leakage(splits, labels.codes.size)
-    scaler = fit_scaler_on_train(files, rc, schema, splits)
+
+    # Fit scaler tren train, roi moi loai cot - vi tieu chi loai (missing/hang so/
+    # trung lap) deu phai tinh CHI tren tap train. Min-Max doc lap tung cot nen
+    # cat bot cot khong lam sai thong ke, khong can fit lai.
+    scaler_full = fit_scaler_on_train(files, rc, schema, splits)
+    sample = read_train_sample(files, rc, schema, splits)
+    selection = select_columns(schema, scaler_full, cfg, sample)
+    del sample
+
+    n_before = schema.n_features
+    schema = schema.pruned(selection.keep_mask, selection.dropped)
+    scaler = scaler_full.subset(selection.keep_mask)
+    LOG.info("Loai %d cot, giu %d/%d feature", len(selection.dropped),
+             schema.n_features, n_before)
+
     geom = geometry_from_config(schema.n_features, cfg)
 
     cache_path = Path(dcfg["cache_dir"]) / "feature_cache.npy"
@@ -614,12 +749,6 @@ def prepare_dataset(cfg: dict, out_dir: Path, *, files=None) -> PreparedData:
                for c in range(labels.num_classes)}
         for name, idx in (("train", splits.train), ("val", splits.val), ("test", splits.test))
     }
-    dropped_high_missing = [
-        {"name": c["name"], "missing_ratio": c["missing_ratio"]}
-        for c in scaler.to_dict()["columns"]
-        if c["missing_ratio"] > cfg["preprocessing"]["drop_column_if_missing_ratio_above"]
-    ]
-
     artifacts = {
         "feature_schema.json": schema.to_dict(),
         "label_mapping.json": labels.to_dict(),
@@ -632,7 +761,14 @@ def prepare_dataset(cfg: dict, out_dir: Path, *, files=None) -> PreparedData:
             "scaler": "minmax_[0,1]_fit_train_only",
             "clip_to_range": True,
             "dropped_columns": schema.dropped_columns,
-            "columns_over_missing_threshold": dropped_high_missing,
+            "n_features_before_pruning": n_before,
+            "n_features_final": schema.n_features,
+            "pruning_rules": {
+                "missing_ratio_above": cfg["preprocessing"]["drop_column_if_missing_ratio_above"],
+                "drop_constant_columns": dcfg.get("drop_constant_columns", True),
+                "drop_duplicate_columns": dcfg.get("drop_duplicate_columns", True),
+                "duplicate_check": "chu ky thong ke tren train + doi chieu that tren mau <= 50k hang",
+            },
             "wavelet": geom.to_dict(),
             "wavelet_geometry_hash": geometry_hash(geom, schema.feature_columns),
             "swt_padding": {"sequence": geom.pad_mode, "image": geom.image_pad_mode,

@@ -55,6 +55,12 @@ def cfg():
             "drop_identifier_columns": True,
             "identifier_columns": ["Flow ID", "Source IP", "Destination IP",
                                    "Timestamp", "Unnamed: 0", "SimillarHTTP"],
+            "drop_constant_columns": True,
+            "drop_duplicate_columns": True,
+        },
+        "preprocessing": {
+            "drop_column_if_missing_ratio_above": 0.80,
+            "order": ["split", "fit_scaler_on_train", "transform", "swt", "cache"],
         },
         "split": {"test_size": 0.30, "val_size_within_trainval": 0.15,
                   "stratify": True, "group_aware": False, "group_key": None,
@@ -265,3 +271,111 @@ def test_batch_sampler_covers_every_sample_exactly_once():
     seen = np.concatenate(list(bs.batches(epoch=1)))
     assert seen.size == 1000
     assert np.array_equal(np.sort(seen), np.arange(1000)), "khong lap, khong bo sot"
+
+
+# ------------------------------------------------ loai cot (muc 3.B, 3.C.1)
+def _fit(tmp_path, cfg, rows=1000, **kw):
+    _, files = make_parquet(tmp_path, rows=rows, **kw)
+    s = D.discover_schema(files, cfg)
+    rc = D.row_counts_of(files)
+    labels = D.scan_labels(files, s, rc)
+    sp = D.make_splits(labels, cfg)
+    sc = D.fit_scaler_on_train(files, rc, s, sp)
+    return files, rc, s, labels, sp, sc
+
+
+def test_constant_column_is_dropped(tmp_path, cfg):
+    files, rc, s, _, sp, sc = _fit(tmp_path, cfg)
+    sample = D.read_train_sample(files, rc, s, sp)
+    sel = D.select_columns(s, sc, cfg, sample)
+
+    dropped = {d["name"]: d for d in sel.dropped}
+    assert " Feat1" in dropped, "Feat1 la hang so, phai bi loai"
+    assert dropped[" Feat1"]["reason"] == "constant_on_train"
+    assert sel.n_kept == N_FEAT - 1
+
+
+def test_constant_column_kept_when_disabled(tmp_path, cfg):
+    cfg["data"]["drop_constant_columns"] = False
+    cfg["data"]["drop_duplicate_columns"] = False
+    files, rc, s, _, sp, sc = _fit(tmp_path, cfg)
+    sel = D.select_columns(s, sc, cfg, None)
+    assert sel.n_kept == N_FEAT, "tat co che thi phai giu nguyen"
+
+
+def test_high_missing_column_is_dropped(tmp_path, cfg):
+    cfg["preprocessing"] = {"drop_column_if_missing_ratio_above": 0.001}
+    files, rc, s, _, sp, sc = _fit(tmp_path, cfg)
+    sel = D.select_columns(s, sc, cfg, None)
+    reasons = {d["name"]: d["reason"] for d in sel.dropped}
+    assert reasons.get(" Feat0") == "missing_ratio_above_threshold", \
+        "Feat0 co NaN+Inf, vuot nguong 0.1% thi phai bi loai"
+
+
+def test_duplicate_column_is_detected(tmp_path, cfg):
+    """Dung cot lap that: Feat5 duoc sao chep sang FeatDup."""
+    rng = np.random.default_rng(9)
+    out = tmp_path / "dup"
+    out.mkdir(parents=True)
+    rows = 800
+    base = rng.normal(3, 2, rows)
+    cols = {" Label": pa.array(rng.choice(CLASSES, rows, p=[.1, .5, .35, .05]))}
+    for i in range(4):
+        cols[f" Feat{i}"] = pa.array(rng.normal(i, 1 + i, rows))
+    cols[" Feat5"] = pa.array(base)
+    cols[" FeatDup"] = pa.array(base.copy())
+    pq.write_table(pa.table(cols), out / "p.parquet")
+
+    files = [out / "p.parquet"]
+    s = D.discover_schema(files, cfg)
+    rc = D.row_counts_of(files)
+    labels = D.scan_labels(files, s, rc)
+    sp = D.make_splits(labels, cfg)
+    sc = D.fit_scaler_on_train(files, rc, s, sp)
+    sample = D.read_train_sample(files, rc, s, sp)
+    sel = D.select_columns(s, sc, cfg, sample)
+
+    dups = [d for d in sel.dropped if d["reason"] == "duplicate_of"]
+    assert len(dups) == 1
+    assert {dups[0]["name"], dups[0]["duplicate_of"]} == {" Feat5", " FeatDup"}
+
+
+def test_read_train_sample_only_returns_train_rows(tmp_path, cfg):
+    files, rc, s, _, sp, _ = _fit(tmp_path, cfg)
+    sample = D.read_train_sample(files, rc, s, sp, max_rows=100)
+    assert sample.shape == (100, s.n_features)
+    assert sample.shape[0] <= sp.train.size
+
+
+def test_pruning_flows_into_schema_scaler_and_geometry(tmp_path, cfg):
+    """Sau khi loai cot, schema/scaler/hinh hoc wavelet phai dong bo."""
+    files, rc, s, _, sp, sc = _fit(tmp_path, cfg)
+    sample = D.read_train_sample(files, rc, s, sp)
+    sel = D.select_columns(s, sc, cfg, sample)
+
+    s2, sc2 = s.pruned(sel.keep_mask, sel.dropped), sc.subset(sel.keep_mask)
+    assert s2.n_features == sel.n_kept == len(sc2.columns)
+    assert s2.feature_columns == sc2.columns, "thu tu cot phai khop tuyet doi"
+    assert s2.hash != s.hash, "doi tap cot phai doi feature_schema_hash"
+
+    geom = W.geometry_from_config(s2.n_features, cfg)
+    assert geom.n_features == s2.n_features
+
+
+def test_prepare_dataset_applies_pruning_end_to_end(tmp_path, cfg):
+    cfg["data"]["kaggle_input_dir"] = str(tmp_path / "data")
+    cfg["data"]["cache_dir"] = str(tmp_path / "cache")
+    cfg["data"]["parquet_glob"] = "**/*.parquet"
+    cfg["preprocessing"]["order"] = ["split", "fit_scaler_on_train", "transform", "swt", "cache"]
+    make_parquet(tmp_path, n_files=2, rows=1000)
+
+    p = D.prepare_dataset(cfg, tmp_path / "artifacts")
+    pre = p.artifacts["preprocessing.json"]
+    assert pre["n_features_before_pruning"] == N_FEAT
+    assert pre["n_features_final"] == p.schema.n_features < N_FEAT
+    assert any(d["reason"] == "constant_on_train" for d in pre["dropped_columns"])
+
+    # cache phai co dung so cot sau khi loai
+    mm = np.load(p.cache_path, mmap_mode="r")
+    assert mm.shape[1] == p.schema.n_features
+    assert p.geom.n_features == p.schema.n_features
