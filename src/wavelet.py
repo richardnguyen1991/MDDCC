@@ -22,6 +22,14 @@ import pywt
 SUBBAND_ORDER = ("cD1", "cD2", "cD3", "cA3")
 
 
+def pooled_side(side: int, n_pools: int, *, ceil_mode: bool = True) -> int:
+    """Canh feature map sau n_pools lan MaxPool2d(2x2)."""
+    s = int(side)
+    for _ in range(n_pools):
+        s = math.ceil(s / 2) if ceil_mode else s // 2
+    return s
+
+
 @dataclass(frozen=True)
 class WaveletGeometry:
     """Hinh hoc co dinh cua phep bien doi. Bat buoc khop giua train/eval/explain."""
@@ -34,10 +42,23 @@ class WaveletGeometry:
     pad_mode: str        # padding chuoi truoc SWT
     image_pad_mode: str  # padding tu n_padded len side*side
     subband_order: tuple[str, ...] = SUBBAND_ORDER
+    n_pool_levels: int = 3       # so lan MaxPool trong moi nhanh CNN (Table 3)
+    pool_ceil_mode: bool = True
+    min_final_map: int = 2       # canh feature map toi thieu truoc lop FC
+    side_bumped_from: int | None = None   # S goc theo cong thuc, neu da phai nang
 
     @property
     def n_subbands(self) -> int:
         return len(self.subband_order)
+
+    @property
+    def final_map_side(self) -> int:
+        """Canh feature map di vao lop FC."""
+        return pooled_side(self.side, self.n_pool_levels,
+                           ceil_mode=self.pool_ceil_mode)
+
+    def flatten_dim(self, channels: int = 32) -> int:
+        return channels * self.final_map_side ** 2
 
     @property
     def image_shape(self) -> tuple[int, int, int]:
@@ -58,6 +79,8 @@ class WaveletGeometry:
         d["image_shape"] = list(self.image_shape)
         d["n_image_pad"] = self.n_image_pad
         d["n_swt_pad"] = self.n_padded - self.n_features
+        d["final_map_side"] = self.final_map_side
+        d["flatten_dim_at_32ch"] = self.flatten_dim(32)
         return d
 
 
@@ -70,8 +93,19 @@ def compute_geometry(
     image_pad_mode: str = "constant",
     min_side: int = 8,
     force_side: int | None = None,
+    n_pool_levels: int = 3,
+    pool_ceil_mode: bool = True,
+    min_final_map: int = 2,
 ) -> WaveletGeometry:
-    """F -> F_swt -> S theo dung cong thuc muc 2.A."""
+    """F -> F_swt -> S theo dung cong thuc muc 2.A, kem rang buoc chong sup do.
+
+    Cong thuc S = max(8, ceil(sqrt(F_swt))) mot minh KHONG an toan: voi F <= 64
+    thi S = 8 va sau 3 lan MaxPool 2x2 feature map con 1x1, tuc ca 4 nhanh CNN
+    bi nen xuong 32 so truoc lop FC. So cot dac trung thay doi theo ket qua loai
+    cot (hang so / trung lap / thieu qua nhieu), nen tinh huong nay co the xay ra
+    ma khong ai de y. Vi vay S duoc NANG len den khi feature map cuoi >=
+    min_final_map, va viec nang duoc ghi lai trong side_bumped_from.
+    """
     if n_features < 1:
         raise ValueError(f"n_features phai >= 1, nhan {n_features}")
     if level < 1:
@@ -82,8 +116,24 @@ def compute_geometry(
 
     if force_side is not None:
         side = int(force_side)
+        if side * side < n_padded:
+            raise ValueError(
+                f"force_side={side} qua nho: {side}*{side} < F_swt={n_padded}."
+            )
+        final = pooled_side(side, n_pool_levels, ceil_mode=pool_ceil_mode)
+        if final < min_final_map:
+            raise ValueError(
+                f"force_side={side} lam feature map cuoi con {final}x{final} "
+                f"(< min_final_map={min_final_map}) -> chi con "
+                f"{32 * final ** 2} chieu truoc lop FC. Tang force_side."
+            )
+        bumped_from = None
     else:
-        side = max(min_side, math.ceil(math.sqrt(n_padded)))
+        base = max(min_side, math.ceil(math.sqrt(n_padded)))
+        side = base
+        while pooled_side(side, n_pool_levels, ceil_mode=pool_ceil_mode) < min_final_map:
+            side += 1
+        bumped_from = base if side != base else None
 
     if side * side < n_padded:
         raise ValueError(
@@ -98,6 +148,10 @@ def compute_geometry(
         wavelet=wavelet,
         pad_mode=pad_mode,
         image_pad_mode=image_pad_mode,
+        n_pool_levels=n_pool_levels,
+        pool_ceil_mode=pool_ceil_mode,
+        min_final_map=min_final_map,
+        side_bumped_from=bumped_from,
     )
 
 
@@ -109,6 +163,7 @@ def geometry_from_config(n_features: int, cfg: dict) -> WaveletGeometry:
             "pywt.wavedec co downsampling, khong dung duoc."
         )
     rs = w.get("reshape", {})
+    m = cfg.get("model", {})
     return compute_geometry(
         n_features,
         level=w["level"],
@@ -117,6 +172,9 @@ def geometry_from_config(n_features: int, cfg: dict) -> WaveletGeometry:
         image_pad_mode=rs.get("pad_mode", "constant"),
         min_side=rs.get("min_side", 8),
         force_side=rs.get("force_side"),
+        n_pool_levels=len(m.get("branches", [None, None, None])),
+        pool_ceil_mode=m.get("pool_ceil_mode", True),
+        min_final_map=rs.get("min_final_map", 2),
     )
 
 
@@ -192,6 +250,8 @@ def geometry_hash(geom: WaveletGeometry, feature_order: Sequence[str]) -> str:
         "n_padded": geom.n_padded,
         "side": geom.side,
         "subband_order": list(geom.subband_order),
+        "n_pool_levels": geom.n_pool_levels,
+        "pool_ceil_mode": geom.pool_ceil_mode,
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
     return hashlib.sha256(blob).hexdigest()

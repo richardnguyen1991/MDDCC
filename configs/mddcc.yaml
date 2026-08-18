@@ -16,7 +16,9 @@ experiment:
 data:
   source: kaggle                  # kaggle | s3 (mac dinh kaggle)
   kaggle_dataset_slug: dungnguyen28101991/cicddos2019-parquet
-  kaggle_input_dir: /kaggle/input/cicddos2019-parquet   # READ-ONLY tuyet doi
+  # Duong dan mount THAT, xac minh bang discovery ngay 2026-08-18.
+  # Kaggle dat ten thu muc theo slug + cau truc cua dataset, khong theo tieu de.
+  kaggle_input_dir: /kaggle/input/datasets/dungnguyen28101991/cicddos2019-parquet/cicddos2019_parquet_preserved/data   # READ-ONLY tuyet doi
   s3_fallback_uri: ""             # chi dung khi source=s3, chay ngoai Kaggle
   cache_dir: /kaggle/temp/mddcc_cache   # KHONG dung /kaggle/working (gioi han 20GB)
   parquet_glob: "**/*.parquet"
@@ -78,6 +80,10 @@ wavelet:
     min_side: 8                   # S = max(8, ceil(sqrt(F_swt)))
     force_side: null              # dat so nguyen de ep S (vd 16); null = theo cong thuc
     pad_mode: constant            # pad tu F_swt len S*S bang 0; vi tri pad bi bo khi quy SHAP
+    # Rang buoc chong sup do: S phai du lon de sau 3 lan MaxPool 2x2 feature map
+    # con >= 2x2. Neu khong, F <= 64 cho S=8 -> map 1x1 -> chi 32 chieu vao FC.
+    # So feature thay doi theo ket qua loai cot nen phai chan tu dong.
+    min_final_map: 2
   # PHUONG AN C (giu tron 70.4M hang): cache subband [N,4,9,9] = 91.3 GB > dia Kaggle.
   # Nen chi cache feature da scale [N,F] = 22.5 GB, SWT tinh on-the-fly theo lo.
   # Chi phi do duoc: 0.2 h/epoch so voi 4.1 h compute (~5%).

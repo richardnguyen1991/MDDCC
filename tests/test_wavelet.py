@@ -25,8 +25,51 @@ def test_padding_is_multiple_of_2_pow_level(n_features):
 
 
 def test_min_side_floor_is_respected():
+    """San min_side=8 duoc ap dung truoc, sau do rang buoc min_final_map nang len 9."""
     g = W.compute_geometry(16, level=3, min_side=8)
-    assert g.side == 8               # ceil(sqrt(16))=4 nhung san la 8
+    assert g.side_bumped_from == 8   # ceil(sqrt(16))=4 -> san 8
+    assert g.side == 9               # 8 se sup ve 1x1 sau 3 lan pool
+
+
+# ------------------------------------------- rang buoc chong sup do feature map
+def test_pooled_side_matches_maxpool_behaviour():
+    assert W.pooled_side(9, 3) == 2          # ceil: 9->5->3->2
+    assert W.pooled_side(9, 3, ceil_mode=False) == 1   # floor: 9->4->2->1
+    assert W.pooled_side(10, 3) == 2
+    assert W.pooled_side(8, 3) == 1
+
+
+def test_side_is_bumped_when_feature_map_would_collapse():
+    """F <= 64 cho S = 8, sau 3 lan pool con 1x1 -> chi 32 chieu truoc FC."""
+    g = W.compute_geometry(64, level=3)
+    assert g.side_bumped_from == 8
+    assert g.side == 9
+    assert g.final_map_side == 2
+    assert g.flatten_dim(32) == 128
+
+
+def test_side_not_bumped_when_already_safe():
+    g = W.compute_geometry(81, level=3)
+    assert g.n_padded == 88 and g.side == 10
+    assert g.side_bumped_from is None
+    assert g.final_map_side == 2 and g.flatten_dim(32) == 128
+
+
+def test_unsafe_force_side_is_rejected():
+    with pytest.raises(ValueError, match="min_final_map"):
+        W.compute_geometry(64, level=3, force_side=8)
+
+
+def test_force_side_too_small_for_swt_is_rejected():
+    with pytest.raises(ValueError, match="qua nho"):
+        W.compute_geometry(81, level=3, force_side=8)
+
+
+def test_floor_pooling_needs_a_much_larger_side():
+    """Neu tat ceil_mode thi phai nang S len nhieu hon de tranh sup do."""
+    g = W.compute_geometry(81, level=3, pool_ceil_mode=False)
+    assert g.final_map_side >= 2
+    assert g.side >= 16
 
 
 def test_exactly_four_subbands_of_original_length():
