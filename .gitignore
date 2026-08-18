@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Cache du lieu - TUYET DOI khong commit (22.5 GB memmap)
+*.npy
+feature_cache*
+/cache/
+/artifacts/
+/kaggle_temp/
+
+# Bi mat - khong bao gio commit (muc 8.A)
+kaggle.json
+.kaggle/
+.env
+*.pem
+credentials*
+
+# Artifact sinh ra khi chay - song tren S3, khong song trong git
+/figures/
+/metrics/
+*.pt
+*.log

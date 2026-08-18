@@ -1,0 +1,260 @@
+# ============================================================================
+# MDDCC - Multi-Dimensional Deep Convolutional Classifier
+# Tai hien: Wang K. et al., Sci Rep 14:16421 (2024), DOI 10.1038/s41598-024-66907-z
+# TOAN BO sieu tham so nam o day. Khong hardcode trong src/.
+# Bucket/prefix/credential doc tu bien moi truong (GitHub Secrets / Kaggle Secrets).
+# ============================================================================
+version: 1
+
+experiment:
+  role: paper_reproduction_mddcc
+  run_id_prefix: mddcc            # run_id = mddcc_<yyyymmdd-HHMM>
+  seed: 42
+  deterministic_algorithms: true  # torch.use_deterministic_algorithms(True)
+
+# ---------------------------------------------------------------- DATA (3.A)
+data:
+  source: kaggle                  # kaggle | s3 (mac dinh kaggle)
+  kaggle_dataset_slug: dungnguyen28101991/cicddos2019-parquet
+  kaggle_input_dir: /kaggle/input/cicddos2019-parquet   # READ-ONLY tuyet doi
+  s3_fallback_uri: ""             # chi dung khi source=s3, chay ngoai Kaggle
+  cache_dir: /kaggle/temp/mddcc_cache   # KHONG dung /kaggle/working (gioi han 20GB)
+  parquet_glob: "**/*.parquet"
+  read_row_group_wise: true
+  dtype: float32
+  fail_fast_on_schema_mismatch: true
+
+  # Nhan (3.A) - thu tu uu tien, fail-fast neu khong xac dinh duoc
+  label:
+    column_candidates: ["Label", " Label", "Class", "label"]
+    strip_column_whitespace: true
+    infer_from_path_if_missing: true    # suy tu ten file / ten thu muc
+    fail_if_undetermined: true
+
+  # Cot dinh danh / ro ri (3.B) - mac dinh XOA
+  drop_identifier_columns: true
+  identifier_columns:
+    - "Flow ID"
+    - "Source IP"
+    - "Src IP"
+    - "Destination IP"
+    - "Dst IP"
+    - "Timestamp"
+    - "Unnamed: 0"
+    - "SimillarHTTP"
+  drop_constant_columns: true
+  drop_duplicate_columns: true
+  feature_selection: none         # BAT BUOC none - dung TAT CA feature con lai
+
+# ------------------------------------------------------- PREPROCESSING (3.C)
+preprocessing:
+  replace_inf_with_nan: true
+  drop_column_if_missing_ratio_above: 0.80
+  impute_strategy: mean           # trung binh tinh CHI tren tap train
+  categorical_encoding: one_hot
+  scaler: minmax                  # fit CHI tren train -> scaler_stats.json
+  scaler_range: [0.0, 1.0]
+  order: [split, fit_scaler_on_train, transform, swt, cache]
+
+# -------------------------------------------------------------- SPLIT (3.D)
+split:
+  test_size: 0.30                 # 7:3 dung bai bao
+  val_size_within_trainval: 0.15  # -> train 59.5% / val 10.5% / test 30%
+  stratify: true
+  group_aware: false              # bat neu discovery thay flow trung lap
+  group_key: null
+  seed: 42
+  assert_no_overlap: true         # -> sample_manifest.json
+
+# ------------------------------------------------------------ WAVELET (2.A)
+wavelet:
+  name: db4
+  level: 3
+  transform: swt                  # BAT BUOC swt (pywt.swt), KHONG wavedec
+  subband_order: [cD1, cD2, cD3, cA3]   # dung 4 subband, cung do dai chuoi goc
+  pad_mode: reflect
+  length_multiple: 8              # F_swt = ceil(F / 2^level) * 8
+  reshape:
+    min_side: 8                   # S = max(8, ceil(sqrt(F_swt)))
+    force_side: null              # dat so nguyen de ep S (vd 16); null = theo cong thuc
+    pad_mode: constant            # pad tu F_swt len S*S bang 0; vi tri pad bi bo khi quy SHAP
+  # PHUONG AN C (giu tron 70.4M hang): cache subband [N,4,9,9] = 91.3 GB > dia Kaggle.
+  # Nen chi cache feature da scale [N,F] = 22.5 GB, SWT tinh on-the-fly theo lo.
+  # Chi phi do duoc: 0.2 h/epoch so voi 4.1 h compute (~5%).
+  materialize: on_the_fly         # on_the_fly | memmap_subbands (chi dung khi N nho)
+  cache_hash_fields: [feature_order, wavelet, level, pad_mode, length_multiple, side]
+
+# --------------------------------------------------------------- MODEL (2.B)
+model:
+  num_branches: 4                 # 1 nhanh / subband, KHONG chia se trong so
+  branches:
+    - {conv_out: 32, kernel: 3, padding: 1, pool: 2, dropout: 0.2}
+    - {conv_out: 64, kernel: 3, padding: 1, pool: 2, dropout: 0.3}
+    - {conv_out: 32, kernel: 3, padding: 1, pool: 2, dropout: 0.2}
+  activation: relu
+  pool_ceil_mode: true            # XEM MUC "CAN ANH DUYET" - tranh sup ve 1x1
+  compose: sum                    # sum (cong thuc 10, mac dinh) | concat
+  head: linear                    # Linear(32*H'*W' -> num_classes)
+  output_activation: softmax
+
+# ---------------------------------------------------------------- LOSS (2.C)
+loss:
+  name: mse                       # MSE(softmax, one-hot) - KHONG CrossEntropy o run chinh
+  std_regularizer:
+    enabled: true                 # sigma(w), cong thuc (8)(9)
+    lambda_std: 1.0
+    include_bias: false
+    apply_to: [conv, linear]
+  log_components: true            # ghi rieng mse_loss / std_reg vao history.json
+
+# --------------------------------------------------------------- OPTIM (2.D)
+optim:
+  name: sgd                       # mini-batch GD + BP dung bai bao
+  learning_rate: 0.001            # hang so suot 100 epoch (bai bao dung 0.01)
+  momentum: 0.0
+  nesterov: false
+  weight_decay: 0.0               # da co sigma(w)
+  scheduler: none
+  warmup: none
+
+# --------------------------------------------------------------- TRAIN (2.D)
+train:
+  epochs: 100                     # CHINH XAC 100
+  batch_size: 4096
+  early_stopping: false           # KHONG dung som, KHONG chon best epoch
+  imbalance_handling: none        # khong class weight / SMOTE / doi nguong
+  device: cpu                     # BAT BUOC cpu, cam moi loi goi .cuda()
+  torch_num_threads: 4
+  dataloader:
+    shuffle_train: true
+    shuffle_seed_mode: seed_plus_epoch
+    drop_last: false
+    num_workers: 2
+    pin_memory: false
+    persistent_workers: true
+  report_after_first_epoch:
+    - epoch_seconds
+    - step_seconds
+    - eta_100_epochs
+    - sessions_12h_needed
+    - peak_rss_mb
+    - cache_build_seconds
+
+# --------------------------------------------------------- CHECKPOINT (muc 4)
+checkpoint:
+  interval_steps: 200
+  save_every_epoch: true
+  keep_last_n: 3
+  permanent_every_n_epochs: 10    # epoch_010.pt, epoch_020.pt, ...
+  final_name: final_model_epoch_100.pt
+  verify_hashes: [params_hash, feature_schema_hash, scaler_hash]
+  on_hash_mismatch: fail_fast
+  resume_mid_epoch: true
+  rng_state: [python, numpy, torch]
+
+session:
+  time_limit_seconds: 40800       # 11h20m
+  exit_guard_seconds: 1200        # con ~20 phut -> luu va thoat code 0
+  exit_reason_on_guard: time_guard
+
+# ------------------------------------------------------------------ S3 (7.H)
+s3:
+  bucket_env: S3_BUCKET
+  prefix_env: S3_PREFIX
+  region_env: AWS_DEFAULT_REGION
+  layout:
+    checkpoints: checkpoints
+    metrics: metrics
+    figures: figures
+    raw: raw
+    explainability: explainability
+    config: config
+    cache: cache                  # CHI manifest/hash, khong upload du lieu train
+    logs: logs
+    orchestration: orchestration
+  safe_upload:
+    tmp_prefix: _tmp
+    verify: [size, sha256]
+    method: put_tmp_then_copy_then_delete
+  upload_after_each_epoch:
+    - history.json
+    - training_state.json
+    - learning_curves
+    - epoch_time
+  current_run_id_key: current_run_id.json
+
+# ------------------------------------------------------------ EVALUATE (5, 6)
+evaluate:
+  labels_from: label_mapping.json
+  binary_view: true               # BENIGN vs ATTACK, de so Table 9
+  chunked_confusion_matrix: true
+  float_round_csv: 6
+  float_round_figure: 4
+  classification_report_digits: 4
+  roc_pr_max_samples: 2000000     # chi de VE; metric van tinh tren toan bo test
+  benchmark:
+    warmup_iters: 50
+    measure_iters: 500
+    report_percentiles: [50, 95]
+    batch_sizes: [4096, 1]
+    split_timers: [t_scale, t_swt, t_forward, t_total]
+    eval_mode_assert_dropout_off: true
+
+# ------------------------------------------------------------- EXPLAIN (7.J)
+explain:
+  run_only_after_epoch: 100
+  sample_max_rows: 50000          # phan tang theo ty le lop tu nhien tu test
+  permutation:
+    scoring: macro_f1
+    n_repeats: 5
+    permute_space: raw_features   # hoan vi TRUOC SWT roi tinh lai SWT
+    keep_negative_values: true
+    seed: 42
+  shap:
+    explainer: gradient
+    max_samples: 2000
+    background_samples: 200
+    auto_downscale_on_oom: true
+    map_subbands_to_raw: sum_abs_by_position   # bo vi tri padding
+  branch_ablation:
+    branches: [cD1, cD2, cD3, cA3]
+    metric: macro_f1
+  top_k_plot: 30
+
+# ---------------------------------------------------------------- VIZ (muc 7)
+viz:
+  backend: Agg
+  dpi: 300
+  formats: [png, pdf, csv]
+  font_size: {axis_label: 10, title: 11, tick: 10}
+  grid: {linestyle: "--", alpha: 0.4}
+  xtick_rotation: 45
+  legend_outside_if_classes_above: 6
+  cm_annot_size_if_classes_above: 10
+  cm_disable_annot_if_classes_above: 15
+  title_template: "MDDCC | {run_id} | final_epoch=100"
+  colormap: tab20
+  distinct_by: [color, linestyle, marker]
+
+# --------------------------------------------- STAGE 1 (3.G, ngoai pham vi)
+stage1_switch_stats:
+  implement_module: true          # src/stage1_switch_stats.py + unit test
+  evaluate_on_dataset: false      # CIC-DDoS2019 khong co so lieu cong switch
+  sigma_rule: 3.0
+  formulas: [R_Pi, R_FI, N_P]
+  note: "Khong danh gia duoc - thieu moi truong Mininet/POX."
+
+# ------------------------------------------- SAI KHAC SO VOI BAI BAO (11.B)
+deviations_from_paper:
+  learning_rate: {paper: "0.01", ours: "0.001", reason: "yeu cau thi nghiem"}
+  batch_size: {paper: "khong neu", ours: "4096", reason: "throughput CPU"}
+  stopping: {paper: "dung khi loss khong giam", ours: "du 100 epoch, khong early stopping", reason: "yeu cau cua toi"}
+  feature_set: {paper: "48/80+", ours: "TAT CA feature tru cot dinh danh", reason: "de danh cho thi nghiem sau"}
+  hardware: {paper: "i9-12900F + RTX 3090, PyTorch 1.8", ours: "Kaggle CPU, PyTorch hien hanh", reason: "rang buoc ha tang"}
+  datasets: {paper: "Mininet + InSDN + CIC-IDS2017 + CIC-DDoS2019", ours: "chi CIC-DDoS2019", reason: "pham vi luan van"}
+  split: {paper: "7:3", ours: "train 59.5 / val 10.5 / test 30", reason: "can val de ve learning curve"}
+  task: {paper: "chu yeu nhi phan", ours: "da lop + binary view", reason: "tan dung nhan per-class"}
+  stage1: {paper: "co, chay tren Mininet/POX", ours: "ngoai pham vi, chi implement + unit test", reason: "khong co moi truong SDN"}
+  regularization: {paper: "Table 3 ghi L2, ly thuyet dung sigma(w)", ours: "sigma(w), weight_decay=0", reason: "ly thuyet la dong gop chinh"}
+  pool_ceil_mode: {paper: "khong neu", ours: "true", reason: "da duyet - tranh feature map sup ve 1x1 (32 -> 128 chieu truoc FC)"}
+  swt_caching: {paper: "khong neu", ours: "SWT on-the-fly, chi cache feature da scale", reason: "cache subband 91.3 GB vuot dia Kaggle; chi phi chi ~5%/epoch"}
