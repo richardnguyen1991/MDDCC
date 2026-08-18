@@ -92,15 +92,36 @@ def main() -> int:
     print("=" * 78)
     print(f"input_dir = {input_dir}")
 
-    if not input_dir.exists():
-        print(f"\nFAIL-FAST: khong thay {input_dir}.")
-        print("Tren Kaggle: kiem tra kernel-metadata.json co 'dataset_sources'.")
-        return 2
+    files = sorted(input_dir.glob(glob_pat)) if input_dir.exists() else []
 
-    files = sorted(input_dir.glob(glob_pat))
+    # Ten thu muc mount tren Kaggle theo SLUG cua dataset, khong theo tieu de
+    # hien thi, nen co the khac duong dan trong config. Tu do lai thay vi bat
+    # nguoi dung doan - va in ro da chon gi de khong bao gio chon nham am tham.
     if not files:
-        print(f"\nFAIL-FAST: khong co file khop {glob_pat} trong {input_dir}.")
-        return 2
+        print(f"\nKhong thay file parquet tai {input_dir} - dang tu do /kaggle/input ...")
+        root = Path("/kaggle/input")
+        if not root.exists():
+            print(f"FAIL-FAST: khong co {input_dir} va cung khong co {root}.")
+            print("Tren Kaggle: kiem tra kernel-metadata.json co 'dataset_sources'.")
+            return 2
+
+        entries = sorted(p.name for p in root.iterdir())
+        print(f"  Co trong /kaggle/input: {entries}")
+        found = sorted(root.glob("**/*.parquet"))
+        if not found:
+            print("FAIL-FAST: khong co file .parquet nao duoi /kaggle/input.")
+            print("Kiem tra dataset da duoc Add Input vao notebook chua.")
+            return 2
+
+        base = found[0].parent
+        while not all(str(f).startswith(str(base) + os.sep) for f in found):
+            if base.parent == base:
+                break
+            base = base.parent
+        input_dir = base
+        files = sorted(input_dir.glob(glob_pat))
+        print(f"  Tu dong chon input_dir = {input_dir}  ({len(files)} file parquet)")
+        print("  Neu sai, chay lai voi --input-dir <duong-dan-dung>.")
 
     # ---------------------------------------------------------------- files
     print(f"\n[1] FILE PARQUET: {len(files)} file")
