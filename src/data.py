@@ -190,25 +190,58 @@ class LabelIndex:
         }
 
 
+def _iter_label_chunks(fp: Path, label_column: str):
+    """Yield tung chunk cot nhan da dictionary-encode (tu vung nho + chi so int32).
+
+    Khong bao gio tao list Python cho ca cot: voi 70.4M hang thi 70.4M object str
+    ton ~4-5 GB RAM va hoan toan khong can thiet.
+    """
+    import pyarrow.compute as pc
+
+    pf = pq.ParquetFile(fp)
+    for i in range(pf.metadata.num_row_groups):
+        col = pf.read_row_group(i, columns=[label_column]).column(0).combine_chunks()
+        enc = pc.dictionary_encode(col)
+        vocab = [str(v).strip() for v in enc.dictionary.to_pylist()]   # chi vai chuc phan tu
+        idx = enc.indices.to_numpy(zero_copy_only=False)
+        yield vocab, idx
+
+
 def scan_labels(files: Sequence[Path], schema: FeatureSchema,
                 row_counts: Sequence[int]) -> LabelIndex:
-    """Doc RIENG cot nhan cua moi file. 70.4M nhan int16 = 141 MB, chap nhan duoc."""
-    total = int(sum(row_counts))
-    raw = np.empty(total, dtype=object)
-    pos = 0
-    for fp, n in zip(files, row_counts):
-        col = pq.read_table(fp, columns=[schema.label_column]).column(0)
-        vals = col.to_pylist()
-        if len(vals) != n:
-            raise RuntimeError(f"{fp.name}: doc {len(vals)} nhan nhung metadata bao {n}")
-        raw[pos:pos + n] = [str(v).strip() for v in vals]
-        pos += n
-        LOG.info("  nhan: %s (%d hang)", fp.name, n)
+    """Doc RIENG cot nhan. Ket qua: mang int16 [N] = 141 MB voi 70.4M hang.
 
-    classes = sorted({str(v) for v in raw})
-    lut = {c: i for i, c in enumerate(classes)}
-    codes = np.fromiter((lut[v] for v in raw), dtype=np.int16, count=total)
-    del raw
+    Luot 1 gom tap lop (chi doc tu vung cua tung chunk).
+    Luot 2 anh xa ve ma toan cuc. Doc cot nhan hai lan van re hon nhieu so voi
+    giu ca cot duoi dang chuoi Python.
+    """
+    total = int(sum(row_counts))
+
+    vocab_all: set[str] = set()
+    for fp in files:
+        for vocab, _ in _iter_label_chunks(fp, schema.label_column):
+            vocab_all.update(vocab)
+        LOG.info("  quet nhan: %s", fp.name)
+
+    classes = sorted(vocab_all)
+    if len(classes) > np.iinfo(np.int16).max:
+        raise RuntimeError(f"{len(classes)} lop - vuot suc chua int16")
+    global_lut = {c: i for i, c in enumerate(classes)}
+
+    codes = np.empty(total, dtype=np.int16)
+    pos = 0
+    for fp, n_expected in zip(files, row_counts):
+        start = pos
+        for vocab, idx in _iter_label_chunks(fp, schema.label_column):
+            # anh xa chi so cuc bo -> ma toan cuc bang mot mang tra cuu nho
+            local_to_global = np.array([global_lut[v] for v in vocab], dtype=np.int16)
+            codes[pos:pos + idx.size] = local_to_global[idx]
+            pos += idx.size
+        if pos - start != n_expected:
+            raise RuntimeError(
+                f"{fp.name}: doc {pos - start} nhan nhung metadata bao {n_expected}")
+    if pos != total:
+        raise RuntimeError(f"Doc {pos} nhan, mong doi {total}")
 
     benign = next((c for c in classes if c.upper() == "BENIGN"), None)
     if benign is None:

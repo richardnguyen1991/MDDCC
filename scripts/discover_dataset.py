@@ -26,7 +26,8 @@ import pyarrow.parquet as pq
 
 # Thong lượng da do thuc te tren CPU 4 luong (bench.py), dung de uoc luong ETA.
 # Doi lai bang --throughput neu do duoc so khac tren Kaggle.
-DEFAULT_TRAIN_THROUGHPUT = 2388.0  # samples/s, fwd+bwd, batch_size=4096
+DEFAULT_TRAIN_THROUGHPUT = 2842.0  # samples/s, fwd+bwd+SGD, batch_size=4096
+DEFAULT_EVAL_THROUGHPUT = 7825.0   # samples/s, forward + no_grad
 DEFAULT_SWT_THROUGHPUT = 96796.0   # rows/s, db4 level 3, axis=1
 KAGGLE_SESSION_SECONDS = 40800     # 11h20m
 
@@ -63,7 +64,9 @@ def main() -> int:
     ap.add_argument("--config", type=Path, default=None)
     ap.add_argument("--input-dir", type=Path, default=None)
     ap.add_argument("--out", type=Path, default=Path("data_profile.json"))
-    ap.add_argument("--throughput", type=float, default=DEFAULT_TRAIN_THROUGHPUT)
+    ap.add_argument("--throughput", type=float, default=DEFAULT_TRAIN_THROUGHPUT,
+                    help="mau/s khi train; do lai tren Kaggle roi truyen vao")
+    ap.add_argument("--eval-throughput", type=float, default=DEFAULT_EVAL_THROUGHPUT)
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--count-labels", action="store_true",
                     help="Doc cot nhan cua MOI file de dem phan bo lop (ton I/O, nen bat).")
@@ -77,9 +80,12 @@ def main() -> int:
         min_side = cfg["wavelet"]["reshape"]["min_side"]
         force_side = cfg["wavelet"]["reshape"]["force_side"]
         batch_size = cfg["train"]["batch_size"]
+        test_frac = cfg["split"]["test_size"]
+        val_frac = cfg["split"]["val_size_within_trainval"]
     else:
         input_dir = Path(args.input_dir or "/kaggle/input/cicddos2019-parquet")
         glob_pat, level, min_side, force_side, batch_size = "**/*.parquet", 3, 8, None, 4096
+        test_frac, val_frac = 0.30, 0.15
 
     print("=" * 78)
     print("MDDCC - BUOC 2a: DISCOVERY KAGGLE DATASET")
@@ -164,10 +170,17 @@ def main() -> int:
     label_counts: dict[str, int] = {}
     if args.count_labels:
         print("\n[3] PHAN BO LOP (doc rieng cot nhan)")
+        import pyarrow.compute as pc
+
         counter: Counter[str] = Counter()
         for fp in files:
-            tbl = pq.read_table(fp, columns=[label_col])
-            counter.update(str(v) for v in tbl.column(0).to_pylist())
+            # value_counts tren cot da dictionary-encode: khong tao list Python
+            # cho 70.4M hang (se ton ~4-5 GB RAM va rat cham).
+            pf = pq.ParquetFile(fp)
+            for i in range(pf.metadata.num_row_groups):
+                col = pf.read_row_group(i, columns=[label_col]).column(0).combine_chunks()
+                for pair in pc.value_counts(col):
+                    counter[str(pair["values"]).strip()] += pair["counts"].as_py()
             print(f"    ... {fp.name}")
         label_counts = dict(counter.most_common())
         print(f"\n  {'lop':<20}{'so mau':>14}{'ty le %':>10}")
@@ -190,18 +203,31 @@ def main() -> int:
     print(f"  4 subband cD1,cD2,cD3,cA3, moi subband dai {F_swt} = do dai chuoi goc")
 
     # ---------------------------------------------------------- kha thi CPU
-    sec_epoch = total_rows / args.throughput
+    # Mot epoch chi duyet tap TRAIN (fwd+bwd) roi danh gia tap VAL (forward).
+    # Khong duoc lay total_rows lam co so - se uoc luong thua rat nhieu.
+    train_rows = total_rows * (1 - test_frac) * (1 - val_frac)
+    val_rows = total_rows * (1 - test_frac) * val_frac
+    sec_train = train_rows / args.throughput
+    sec_val = val_rows / args.eval_throughput
+    sec_epoch = sec_train + sec_val
     sec_total = sec_epoch * args.epochs
     cache_gb = total_rows * 4 * side * side * 4 / 1e9
     raw_gb = total_rows * F * 4 / 1e9
-    swt_hours = total_rows / DEFAULT_SWT_THROUGHPUT / 3600
+    swt_hours = train_rows / DEFAULT_SWT_THROUGHPUT / 3600
 
-    print(f"\n[5] UOC LUONG KHA THI (throughput do thuc te = {args.throughput:,.0f} mau/s, bs={batch_size})")
-    print(f"  1 epoch                 : {sec_epoch/3600:>10,.2f} h")
+    print(f"\n[5] UOC LUONG KHA THI (train {args.throughput:,.0f} mau/s, "
+          f"eval {args.eval_throughput:,.0f} mau/s, bs={batch_size})")
+    print(f"  Split                   : train {train_rows:,.0f} | val {val_rows:,.0f} "
+          f"| test {total_rows*test_frac:,.0f}")
+    print(f"  1 epoch                 : {sec_epoch/3600:>10,.2f} h "
+          f"(train {sec_train/3600:.2f} h + val {sec_val/3600:.2f} h)")
+    print(f"  Step moi epoch          : {math.ceil(train_rows/batch_size):>10,}")
     print(f"  {args.epochs} epoch              : {sec_total/3600:>10,.0f} h = {sec_total/86400:,.0f} ngay")
     print(f"  So session Kaggle 11h20m: {math.ceil(sec_total/KAGGLE_SESSION_SECONDS):>10,}")
-    print(f"  Cache SWT float32       : {cache_gb:>10,.1f} GB")
-    print(f"  (Cache feature tho      : {raw_gb:>10,.1f} GB, SWT on-the-fly ton {swt_hours:.2f} h/epoch)")
+    print(f"  Cache SWT float32       : {cache_gb:>10,.1f} GB  <- neu cache subband")
+    print(f"  Cache feature da scale  : {raw_gb:>10,.1f} GB  <- phuong an dang dung")
+    print(f"  SWT on-the-fly          : {swt_hours:>10,.2f} h/epoch "
+          f"({100*swt_hours*3600/sec_epoch:.1f}% chi phi epoch)")
     if cache_gb > 50 or sec_total / KAGGLE_SESSION_SECONDS > 10:
         print("\n  ==> VUOT NGUON LUC KAGGLE. Dung lai, bao cao cho chu nhiem de quyet dinh")
         print("      (muc 3.A: 'khong tu y cat bot du lieu').")
@@ -229,6 +255,10 @@ def main() -> int:
             "train_throughput_samples_per_s": args.throughput,
             "seconds_per_epoch": sec_epoch,
             "seconds_total": sec_total,
+            "eval_throughput_samples_per_s": args.eval_throughput,
+            "train_rows": int(train_rows),
+            "val_rows": int(val_rows),
+            "steps_per_epoch": math.ceil(train_rows / batch_size),
             "kaggle_sessions_needed": math.ceil(sec_total / KAGGLE_SESSION_SECONDS),
             "swt_cache_gb": cache_gb,
             "raw_feature_cache_gb": raw_gb,
