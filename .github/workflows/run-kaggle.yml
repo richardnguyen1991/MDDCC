@@ -40,6 +40,8 @@ jobs:
       S3_PREFIX: ${{ secrets.S3_PREFIX }}
       KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
       MAX_RESTARTS: "60"
+      # 16 gio: du cho session 11h20m cong thoi gian Kaggle xep hang
+      STS_DURATION_SECONDS: "57600"
 
     steps:
       - uses: actions/checkout@v4
@@ -62,7 +64,7 @@ jobs:
           echo "Du 6 secret."
 
       - name: Cai kaggle + boto3
-        run: pip install --quiet kaggle boto3
+        run: pip install --quiet kaggle boto3 PyYAML
 
       # KAGGLE_API_TOKEN co the la chuoi key thuan HOAC toan bo noi dung
       # kaggle.json - phai tu nhan dang ca hai dang (muc 8.A).
@@ -98,14 +100,30 @@ jobs:
           PY
           chmod 600 ~/.kaggle/kaggle.json
 
+      # Kaggle KHONG luu secret nao. Credential di theo notebook luc push:
+      # sts:GetSessionToken bang khoa dai han (chi nam tren GitHub) -> token tam
+      # thoi -> tiem vao ban notebook trong thu muc TAM. Thu muc kernel/ da
+      # commit KHONG bao gio bi ghi vao.
+      - name: Dung kernel co credential tam thoi
+        id: prepare
+        run: |
+          python scripts/prepare_kernel_push.py \
+            --out-dir "${RUNNER_TEMP}/kernel_push" \
+            --duration "$STS_DURATION_SECONDS"
+
       - name: Dieu phoi (quyet dinh + push neu can)
         id: orchestrate
         run: |
           python scripts/kaggle_orchestrator.py \
             --kernel "$KAGGLE_KERNEL" \
-            --kernel-dir kernel \
+            --kernel-dir "${RUNNER_TEMP}/kernel_push" \
             --max-restarts "$MAX_RESTARTS" \
             ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      # Khong de token con nam tren dia runner sau khi xong
+      - name: Xoa credential tam thoi
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/kernel_push" ~/.kaggle/kaggle.json
 
       # Chong vong lap vo han: 3 lan push lien tiep ma current_epoch khong tang
       # thi orchestrator dat abort=true, ghi status=failed len S3, va mo Issue.
@@ -131,8 +149,11 @@ jobs:
               "1. Log cua kernel tren Kaggle - notebook chet o buoc nao?",
               "2. `/kaggle/input` co dataset khong (kernel-metadata.json co",
               "   `dataset_sources` chua)?",
-              "3. Nam secret AWS tren Kaggle con hieu luc khong?",
-              "4. `cache_build_seconds` - co phai session het gio truoc khi",
+              "3. Credential tam thoi co het han truoc khi session xong khong?",
+              "   Xem muc 4 cua notebook - neu con duoi 1 gio thi tang",
+              "   `STS_DURATION_SECONDS`.",
+              "4. Khoa dai han tren GitHub Secrets con hieu luc khong?",
+              "5. `cache_build_seconds` - co phai session het gio truoc khi",
               "   xong duoc mot epoch nao?",
               "",
               "### Chay lai sau khi sua",

@@ -42,10 +42,13 @@ khong tao `run_id` moi (tru khi xoa `current_run_id.json`).
 
 Repo: {REPO_URL}
 
-**Truoc khi chay, phai them 5 secret tren Kaggle** (Add-ons -> Secrets):
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`,
-`S3_BUCKET`, `S3_PREFIX`. GitHub Secrets **khong** tu co mat trong runtime cua
-Kaggle.
+**Kaggle KHONG luu secret nao.** Toan bo credential nam tren GitHub Secrets.
+Moi lan `kaggle kernels push`, GitHub Actions goi `sts:GetSessionToken` bang khoa
+dai han de lay mot bo credential TAM THOI roi tiem vao notebook nay. Token tu het
+han sau vai gio; khoa dai han khong bao gio roi khoi GitHub.
+
+=> Dung khoi dong notebook nay bang tay tren UI khi chua tiem credential - no se
+fail-fast o muc 4b. Hay chay workflow **run-kaggle** tren GitHub.
 """)
 
 md("## 1. Fail-fast: dataset phai duoc mount")
@@ -113,10 +116,49 @@ try:
 except ImportError:
     print("shap    KHONG CO -> se bo qua hinh C13")''')
 
-md("""## 4. Doc secret tu Kaggle
+md("""## 4. Nap credential do GitHub Actions tiem vao
 
-Credential AWS **khong** duoc nhet vao notebook, `kernel-metadata.json` hay git
-(muc 8.A). Doc qua `kaggle_secrets`, fallback sang bien moi truong khi chay local.
+Kaggle **khong luu secret nao**. Moi lan push, GitHub Actions goi
+`sts:GetSessionToken` bang khoa dai han (chi nam tren GitHub) de lay mot bo
+credential TAM THOI, roi tiem vao chinh o duoi day. Token tu het han, khoa dai
+han khong bao gio roi khoi GitHub.
+""")
+
+code('''# Chuoi nay do scripts/prepare_kernel_push.py thay the luc push.
+# Ban trong repo LUON rong - co test khang dinh dieu do.
+CREDENTIALS_B64 = "__MDDCC_CREDENTIALS_B64__"
+
+INJECTED = {}
+if CREDENTIALS_B64 and not CREDENTIALS_B64.startswith("__MDDCC"):
+    import base64
+    import datetime as _dt
+    import json
+
+    INJECTED = json.loads(base64.b64decode(CREDENTIALS_B64).decode("utf-8"))
+    expires = INJECTED.pop("expiration", None)
+    for k, v in INJECTED.items():
+        os.environ[k] = v
+    print(f"Da nap {len(INJECTED)} bien tu credential tam thoi do GitHub Actions tiem")
+    if expires:
+        left = (_dt.datetime.fromisoformat(expires)
+                - _dt.datetime.now(_dt.timezone.utc)).total_seconds()
+        print(f"  het han luc {expires} (con {left / 3600:.1f} gio)")
+        if left < 3600:
+            print("  CANH BAO: token con duoi 1 gio, session nay co the "
+                  "khong upload duoc checkpoint cuoi")
+        if left <= 0:
+            raise SystemExit(
+                "FAIL-FAST: credential da het han. Chay lai workflow run-kaggle "
+                "de push phien ban moi voi token moi.")
+else:
+    print("Khong co credential duoc tiem -> se doc tu bien moi truong / "
+          "kaggle_secrets (che do chay tay)")''')
+
+md("""## 4b. Doi chieu credential
+
+Kiem tra du 5 bien can thiet. Thu tu uu tien: credential do Actions tiem vao
+(o tren) -> bien moi truong -> `kaggle_secrets` (neu ai do van muon luu tren
+Kaggle). Khoa dai han TUYET DOI khong nam trong notebook hay git (muc 8.A).
 """)
 
 code('''REQUIRED = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
@@ -147,9 +189,11 @@ for name in REQUIRED:
 
 if missing:
     raise SystemExit(
-        "FAIL-FAST: thieu secret " + ", ".join(missing) + ".\\n"
-        "  Kaggle -> Add-ons -> Secrets, them dung 5 secret roi bat cho notebook nay.\\n"
-        "  GitHub Secrets KHONG tu co mat trong runtime cua Kaggle (muc 8.A)."
+        "FAIL-FAST: thieu " + ", ".join(missing) + ".\\n"
+        "  Cach dung chinh: chay workflow run-kaggle tren GitHub - no goi\\n"
+        "  sts:GetSessionToken va tiem credential tam thoi vao notebook.\\n"
+        "  Kaggle KHONG luu secret nao, dung tim trong Add-ons -> Secrets.\\n"
+        "  Neu chay tay: python scripts/prepare_kernel_push.py --out-dir <dir>"
     )
 
 # Chi in do dai, TUYET DOI khong in gia tri
@@ -253,7 +297,7 @@ print("=" * 62)''')
 
 
 # ============================================================== xuat file
-def build() -> dict:
+def build(credentials_b64: str = "") -> dict:
     cells = []
     for kind, text in CELLS:
         source = text.rstrip("\n").split("\n")
@@ -263,6 +307,10 @@ def build() -> dict:
         else:
             cells.append({"cell_type": "code", "execution_count": None,
                           "metadata": {}, "outputs": [], "source": source})
+    if credentials_b64:
+        for c in cells:
+            c["source"] = [s.replace("__MDDCC_CREDENTIALS_B64__", credentials_b64)
+                           for s in c["source"]]
     return {
         "cells": cells,
         "metadata": {

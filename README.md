@@ -22,7 +22,7 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 | 2a | Discovery Kaggle Dataset (`scripts/discover_dataset.py`) | ✅ xong — **đã chạy thật trên Kaggle 2026-08-18** |
 | 2b | `data.py`, `wavelet.py`, chống rò rỉ split, loại cột, test SWT | ✅ xong |
 | 2c | `stage1_switch_stats.py` — công thức (1)(2)(3) + 3-sigma (§3.G) | ✅ xong — **ngoài phạm vi đánh giá** |
-| — | **Tổng test** | **232/232 pass** |
+| — | **Tổng test** | **242/242 pass** |
 | 3 | `model.py`, `train.py`, `checkpoint.py`, `s3io.py` (resume giữa epoch từ S3) | ✅ xong |
 | 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ✅ xong |
 | 5 | `kernel/`, `.github/workflows/run-kaggle.yml`, chống vòng lặp vô hạn | ✅ xong |
@@ -453,24 +453,77 @@ activity gián tiếp qua Issue/Actions log.
 - **Kaggle Dataset** = dữ liệu đầu vào, **CHỈ ĐỌC**. Không ghi gì vào `/kaggle/input`.
 - **S3** = trạng thái huấn luyện và mọi kết quả. Nơi duy nhất sống sót qua session bị cancel,
   và là nguồn sự thật cho GitHub Actions.
+- **GitHub Secrets** = nơi duy nhất giữ credential. **Kaggle không lưu secret nào** —
+  credential tạm thời được tiêm vào notebook lúc push, xem mục Secrets.
 - Cache cục bộ nằm ở `/kaggle/temp` (không tính vào giới hạn 20 GB của `/kaggle/working`),
   **mất khi session kết thúc** và phải dựng lại mỗi session — chi phí này được đo và ghi
   vào `cache_build_seconds`.
 
-## Secrets
+## Secrets — Kaggle không lưu secret nào
 
-GitHub Actions dùng: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`,
-`S3_BUCKET`, `S3_PREFIX`, `KAGGLE_USERNAME`, `KAGGLE_API_TOKEN`, `KAGGLE_KERNEL`.
+Toàn bộ credential nằm trên **GitHub Secrets**. Kaggle không lưu gì.
 
-**GitHub Secrets không tự có mặt trong runtime của Kaggle.** Phải tự thêm thủ công
-trên Kaggle (Add-ons → Secrets) đúng 5 secret: `AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, `S3_BUCKET`, `S3_PREFIX`.
-Tuyệt đối không nhét credential vào notebook, `kernel-metadata.json` hay git.
+```
+AWS_ACCESS_KEY_ID      AWS_SECRET_ACCESS_KEY   AWS_DEFAULT_REGION
+S3_BUCKET              S3_PREFIX
+KAGGLE_KERNEL = richardnguyen1991/mddcc
+KAGGLE_API_TOKEN       (+ KAGGLE_USERNAME nếu token là key thuần)
+```
 
-Quyền IAM tối thiểu: `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`,
-giới hạn trong `arn:aws:s3:::$S3_BUCKET/$S3_PREFIX/*`.
+### Credential đến được Kaggle bằng cách nào
 
----
+Vấn đề: notebook chạy trên Kaggle cần credential AWS để ghi S3, nhưng GitHub
+Secrets không tự có mặt trong runtime Kaggle. Cách giải quyết:
+
+```
+GitHub Secrets (khoá dài hạn)
+   └─ sts:GetSessionToken (16 giờ)  ← chạy trên runner GitHub
+        └─ base64 → tiêm vào bản notebook trong thư mục TẠM
+             └─ kaggle kernels push từ thư mục tạm
+                  └─ notebook giải mã → biến môi trường → ghi S3
+        └─ xoá thư mục tạm (bước `if: always()`)
+```
+
+`scripts/prepare_kernel_push.py` làm việc này. Thư mục `kernel/` đã commit
+**không bao giờ bị ghi vào** — bản trong git luôn chỉ có placeholder
+`__MDDCC_CREDENTIALS_B64__`, và có test khẳng định điều đó cùng với việc file
+không chứa `AKIA`/`ASIA`/`SecretAccessKey`.
+
+Token sống 16 giờ (`STS_DURATION_SECONDS`), đủ cho session 11h20m cộng thời gian
+Kaggle xếp hàng. Notebook kiểm tra hạn ngay ở mục 4: còn dưới 1 giờ thì cảnh báo,
+đã hết hạn thì fail-fast thay vì chạy 11 giờ rồi mất hết checkpoint.
+
+### Đánh giá bảo mật trung thực
+
+**Được:** khoá dài hạn không bao giờ rời khỏi GitHub. Không có secret nào lưu trên
+Kaggle. Token tự hết hạn.
+
+**Vẫn còn rủi ro:** token tạm thời **có** nằm trong mã nguồn notebook mà Kaggle lưu
+lại. Điều này không tránh được — runtime Kaggle phải có một credential nào đó, và
+presigned URL cũng chỉ là một dạng bearer token khác. Kaggle giữ lại các phiên bản
+kernel cũ, mỗi phiên bản chứa token của lần đó; sau khi hết hạn thì vô hại.
+
+**Vì vậy bắt buộc:** dùng một **IAM user riêng** (không phải root — script từ chối
+khoá root vì chỉ được 3600s và cấp quyền toàn bộ tài khoản), giới hạn policy trong
+`arn:aws:s3:::$S3_BUCKET/$S3_PREFIX/*` với đúng bốn quyền `s3:GetObject`,
+`s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`. Khi đó thiệt hại tối đa nếu
+token bị lộ trong 16 giờ là giới hạn trong prefix của run này.
+
+Nếu cần chặt hơn nữa: đổi sang `sts:AssumeRole` với inline session policy để thu hẹp
+quyền ngay tại thời điểm cấp token.
+
+### Chạy tay khi cần
+
+```bash
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_DEFAULT_REGION=...
+export S3_BUCKET=... S3_PREFIX=...
+python scripts/prepare_kernel_push.py --out-dir /tmp/kernel_push
+kaggle kernels push -p /tmp/kernel_push
+rm -rf /tmp/kernel_push
+```
+
+Notebook **không** khởi động được bằng tay trên Kaggle UI nếu chưa tiêm credential —
+nó sẽ fail-fast ở mục 4b kèm hướng dẫn.
 
 ## Sai khác so với bài báo
 

@@ -184,11 +184,10 @@ def test_notebook_fails_fast_when_dataset_missing():
     assert "dataset_sources" in first, "thong bao loi phai chi ro nguyen nhan"
 
 
-def test_notebook_reads_secrets_from_kaggle_not_hardcoded():
-    assert "kaggle_secrets" in ALL_CODE and "UserSecretsClient" in ALL_CODE
+def test_notebook_needs_all_five_env_vars():
     for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
                  "AWS_DEFAULT_REGION", "S3_BUCKET", "S3_PREFIX"):
-        assert name in ALL_CODE, f"thieu secret {name}"
+        assert name in ALL_CODE, f"thieu {name}"
 
 
 def test_notebook_never_prints_secret_values():
@@ -303,3 +302,108 @@ def test_build_notebook_is_deterministic(tmp_path, monkeypatch):
     importlib.reload(build_notebook)
     rebuilt = json.dumps(build_notebook.build(), indent=1, ensure_ascii=False) + "\n"
     assert rebuilt == before, "kernel/kaggle_notebook.ipynb da lech voi script sinh no"
+
+
+# ============================== credential khong luu tren Kaggle (muc 8.A)
+NB_RAW = (REPO / "kernel" / "kaggle_notebook.ipynb").read_text(encoding="utf-8")
+
+
+def test_committed_notebook_has_no_credentials():
+    """Ban trong git PHAI chi co placeholder, tuyet doi khong co token that."""
+    assert "__MDDCC_CREDENTIALS_B64__" in ALL_CODE, "thieu cho de tiem credential"
+    for bad in ("AKIA", "ASIA", "aws_session_token", "SecretAccessKey"):
+        assert bad not in NB_RAW, f"notebook da commit chua {bad!r}"
+
+
+def test_notebook_decodes_injected_credentials():
+    cell = next(c for c in CODE_CELLS if "CREDENTIALS_B64" in c)
+    assert "base64.b64decode" in cell
+    assert "AWS_SESSION_TOKEN" not in cell, "token den tu payload, khong hardcode"
+    assert "os.environ[k] = v" in cell
+
+
+def test_notebook_fails_fast_on_expired_credentials():
+    """Token het han giua duong -> dung ngay, khong chay 11 gio roi mat het."""
+    cell = next(c for c in CODE_CELLS if "CREDENTIALS_B64" in c)
+    assert "expiration" in cell
+    assert "SystemExit" in cell and "het han" in cell
+    assert "duoi 1 gio" in cell, "phai canh bao khi token gan het han"
+
+
+def test_notebook_no_longer_requires_kaggle_secrets():
+    """Nguoi dung yeu cau Kaggle khong luu secret nao."""
+    assert "them dung 5 secret" not in ALL_CODE
+    assert "GetSessionToken" in NB_RAW, "phai giai thich credential den tu dau"
+
+
+def test_prepare_kernel_push_injects_and_leaves_repo_untouched(tmp_path):
+    import base64
+    import json as _json
+    import re
+    import sys as _sys
+
+    _sys.path.insert(0, str(REPO / "scripts"))
+    import prepare_kernel_push as P
+
+    payload = {"AWS_ACCESS_KEY_ID": "ASIATEST", "AWS_SECRET_ACCESS_KEY": "sk",
+               "AWS_SESSION_TOKEN": "tok", "AWS_DEFAULT_REGION": "ap-southeast-1",
+               "S3_BUCKET": "buck", "S3_PREFIX": "MDDCC",
+               "expiration": "2026-08-20T05:00:00+00:00"}
+    out = P.build_push_dir(tmp_path / "push", P.encode(payload))
+
+    body = (out / "kaggle_notebook.ipynb").read_text(encoding="utf-8")
+    assert "__MDDCC_CREDENTIALS_B64__" not in body, "placeholder phai bi thay"
+    assert (out / "kernel-metadata.json").exists()
+
+    m = re.search(r'CREDENTIALS_B64 = \\"([A-Za-z0-9+/=]+)\\"', body)
+    assert m, "khong tim thay chuoi credential trong notebook da tiem"
+    assert _json.loads(base64.b64decode(m.group(1))) == payload
+
+    # Ban trong repo KHONG bao gio bi ghi vao
+    assert "__MDDCC_CREDENTIALS_B64__" in NB_RAW
+
+
+def test_prepare_kernel_push_without_credentials_keeps_placeholder(tmp_path):
+    import sys as _sys
+
+    _sys.path.insert(0, str(REPO / "scripts"))
+    import prepare_kernel_push as P
+
+    out = P.build_push_dir(tmp_path / "push2", "")
+    assert "__MDDCC_CREDENTIALS_B64__" in (out / "kaggle_notebook.ipynb").read_text(
+        encoding="utf-8")
+
+
+def test_sts_duration_covers_a_full_kaggle_session():
+    """Session 11h20m + thoi gian xep hang -> token phai song lau hon."""
+    import sys as _sys
+
+    _sys.path.insert(0, str(REPO / "scripts"))
+    import prepare_kernel_push as P
+
+    assert P.DEFAULT_DURATION >= 40800 + 3600
+    assert int(WF["jobs"]["orchestrate"]["env"]["STS_DURATION_SECONDS"]) >= 44400
+
+
+def test_workflow_builds_credentials_before_pushing():
+    steps = WF["jobs"]["orchestrate"]["steps"]
+    names = [s.get("name", "") for s in steps]
+    prep = next(i for i, n in enumerate(names) if "credential tam thoi" in n
+                and "Xoa" not in n)
+    push = next(i for i, n in enumerate(names) if "Dieu phoi" in n)
+    wipe = next(i for i, n in enumerate(names) if n.startswith("Xoa"))
+    assert prep < push < wipe, "phai tao -> push -> xoa"
+    assert steps[wipe]["if"] == "always()", "phai xoa token ke ca khi push loi"
+
+
+def test_workflow_pushes_from_temp_dir_not_committed_kernel():
+    step = next(s for s in WF["jobs"]["orchestrate"]["steps"]
+                if s.get("name", "").startswith("Dieu phoi"))
+    assert "kernel_push" in step["run"]
+    assert "--kernel-dir kernel " not in step["run"]
+
+
+def test_prepare_script_refuses_root_credentials():
+    """Khoa root chi duoc 3600s va cap quyen toan bo tai khoan."""
+    src = (REPO / "scripts" / "prepare_kernel_push.py").read_text(encoding="utf-8")
+    assert ":root" in src and "IAM user" in src
