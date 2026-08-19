@@ -1,0 +1,167 @@
+name: run-kaggle
+
+# Muc 8.B. Workflow nay CHI doc/ghi S3 va goi Kaggle API - KHONG train tren
+# runner cua GitHub.
+#
+# Luu y ve cron:
+#   * GitHub tu tat cron sau 60 ngay repo khong hoat dong.
+#   * Cron chay "best effort", co the tre vai phut.
+# Voi ngan sach ~39 session x 11h20m, hai dieu nay khong gay van de: chi can
+# workflow bat duoc thoi diem kernel vua ket thuc.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Chi quyet dinh, khong push kernel"
+        type: boolean
+        default: false
+
+# Khong de hai lan push chong nhau
+concurrency:
+  group: mddcc-kaggle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write          # can de mo Issue khi phat hien vong lap vo han
+
+jobs:
+  orchestrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      S3_PREFIX: ${{ secrets.S3_PREFIX }}
+      KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
+      MAX_RESTARTS: "60"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Kiem tra secrets bat buoc
+        run: |
+          missing=""
+          for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION \
+                      S3_BUCKET S3_PREFIX KAGGLE_KERNEL; do
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Thieu secret:$missing"
+            exit 1
+          fi
+          echo "Du 6 secret."
+
+      - name: Cai kaggle + boto3
+        run: pip install --quiet kaggle boto3
+
+      # KAGGLE_API_TOKEN co the la chuoi key thuan HOAC toan bo noi dung
+      # kaggle.json - phai tu nhan dang ca hai dang (muc 8.A).
+      - name: Dung ~/.kaggle/kaggle.json
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          mkdir -p ~/.kaggle
+          python - <<'PY'
+          import json, os, pathlib, sys
+
+          token = (os.environ.get("KAGGLE_API_TOKEN") or "").strip()
+          user = (os.environ.get("KAGGLE_USERNAME") or "").strip()
+          if not token:
+              sys.exit("::error::Thieu secret KAGGLE_API_TOKEN")
+
+          try:
+              data = json.loads(token)
+              if not isinstance(data, dict) or "key" not in data:
+                  raise ValueError
+              print("KAGGLE_API_TOKEN la noi dung kaggle.json")
+          except (json.JSONDecodeError, ValueError):
+              if not user:
+                  sys.exit("::error::KAGGLE_API_TOKEN la key thuan nen can "
+                           "them secret KAGGLE_USERNAME")
+              data = {"username": user, "key": token}
+              print("KAGGLE_API_TOKEN la key thuan -> ghep voi KAGGLE_USERNAME")
+
+          p = pathlib.Path.home() / ".kaggle" / "kaggle.json"
+          p.write_text(json.dumps(data), encoding="utf-8")
+          print("Da ghi", p, "cho user", data.get("username"))
+          PY
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Dieu phoi (quyet dinh + push neu can)
+        id: orchestrate
+        run: |
+          python scripts/kaggle_orchestrator.py \
+            --kernel "$KAGGLE_KERNEL" \
+            --kernel-dir kernel \
+            --max-restarts "$MAX_RESTARTS" \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      # Chong vong lap vo han: 3 lan push lien tiep ma current_epoch khong tang
+      # thi orchestrator dat abort=true, ghi status=failed len S3, va mo Issue.
+      - name: Mo Issue khi phat hien vong lap vo han
+        if: steps.orchestrate.outputs.abort == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const reason = ${{ toJSON(steps.orchestrate.outputs.abort_reason) }};
+            const title = "MDDCC: tu dong khoi dong lai da bi dung";
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: "open", labels: "mddcc-orchestration",
+            });
+            const body = [
+              "Orchestrator da dung viec tu dong khoi dong lai kernel Kaggle.",
+              "",
+              "**Ly do:** " + reason,
+              "",
+              "`training_state.json` tren S3 da duoc dat `status=failed`.",
+              "",
+              "### Can kiem tra",
+              "1. Log cua kernel tren Kaggle - notebook chet o buoc nao?",
+              "2. `/kaggle/input` co dataset khong (kernel-metadata.json co",
+              "   `dataset_sources` chua)?",
+              "3. Nam secret AWS tren Kaggle con hieu luc khong?",
+              "4. `cache_build_seconds` - co phai session het gio truoc khi",
+              "   xong duoc mot epoch nao?",
+              "",
+              "### Chay lai sau khi sua",
+              "Sua nguyen nhan, dat lai `status` trong `training_state.json`",
+              "thanh `interrupted`, roi chay workflow bang **Run workflow**.",
+              "",
+              "_Workflow run: " + context.serverUrl + "/" + context.repo.owner +
+                "/" + context.repo.repo + "/actions/runs/" + context.runId + "_",
+            ].join("\n");
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+              core.warning("Da comment vao Issue #" + existing.data[0].number);
+            } else {
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ["mddcc-orchestration"],
+              });
+              core.warning("Da mo Issue #" + issue.data.number);
+            }
+
+      - name: Tom tat
+        if: always()
+        run: |
+          echo "### MDDCC orchestration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Kernel: \`$KAGGLE_KERNEL\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Xem log cua step **Dieu phoi** de biet quyet dinh." >> $GITHUB_STEP_SUMMARY

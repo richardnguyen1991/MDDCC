@@ -22,10 +22,10 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 | 2a | Discovery Kaggle Dataset (`scripts/discover_dataset.py`) | ✅ xong — **đã chạy thật trên Kaggle 2026-08-18** |
 | 2b | `data.py`, `wavelet.py`, chống rò rỉ split, loại cột, test SWT | ✅ xong |
 | 2c | `stage1_switch_stats.py` — công thức (1)(2)(3) + 3-sigma (§3.G) | ✅ xong — **ngoài phạm vi đánh giá** |
-| — | **Tổng test** | **183/183 pass** |
+| — | **Tổng test** | **232/232 pass** |
 | 3 | `model.py`, `train.py`, `checkpoint.py`, `s3io.py` (resume giữa epoch từ S3) | ✅ xong |
 | 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ✅ xong |
-| 5 | `kernel/`, `.github/workflows/run-kaggle.yml` | ⏳ chưa làm |
+| 5 | `kernel/`, `.github/workflows/run-kaggle.yml`, chống vòng lặp vô hạn | ✅ xong |
 | 6 | README đầy đủ, chạy thử 2 epoch + kiểm tra resume, rồi chạy đủ 100 epoch | ⏳ chưa làm |
 
 ---
@@ -362,11 +362,89 @@ python make_report.py --run-dir s3://$S3_BUCKET/$S3_PREFIX/<run_id> --upload
 python -m pytest tests -q
 ```
 
+```bash
+# Bước 5 — sinh lại notebook sau khi sửa build_notebook.py
+python scripts/build_notebook.py
+
+# Push kernel bằng tay (thường để GitHub Actions làm)
+kaggle kernels push -p kernel/
+```
+
 > `--max-epochs` **chỉ dùng để chạy thử**. Run chính luôn lấy `train.epochs = 100`
 > từ config và dừng chính xác ở epoch 100.
 
 > Trên Windows, nếu `C:\Users\<user>\AppData\Local\Temp` bị chặn quyền, chạy
 > `python -m pytest tests -q --basetemp=<thư-mục-ghi-được>`.
+
+---
+
+## Tự động hoá: GitHub Actions → Kaggle
+
+### Luồng quyết định
+
+`scripts/kaggle_orchestrator.py` chứa toàn bộ logic; workflow chỉ gọi nó. Hàm `decide()` là
+**hàm thuần** không đọc/ghi gì, nên test được từng nhánh:
+
+| Trạng thái | Quyết định |
+|---|---|
+| `current_epoch ≥ 100` hoặc `status=completed` | `DONE` — không push nữa |
+| kernel `running` / `queued` | `WAIT` — không đụng vào |
+| kernel `complete` / `error` / `cancelAcknowledged`, epoch < 100 | `PUSH` — mở session mới |
+| chưa có `training_state.json` | `PUSH` — khởi động run đầu tiên |
+| **3 lần push liên tiếp mà `current_epoch` đứng yên** | `ABORT` + mở GitHub Issue |
+| `restarts ≥ max_restarts` (60) | `ABORT` |
+
+`max_restarts = 60` vì ngân sách đo được là **39 session**, cộng biên an toàn.
+
+Đã dry-run thật ba tình huống với `LocalStore`: epoch 37/100 + kernel `complete` → `PUSH`;
+kernel `running` → `WAIT`; ba lần push liên tiếp đứng yên ở epoch 37 → `ABORT`.
+
+```bash
+# Thử logic quyết định không cần AWS
+python scripts/kaggle_orchestrator.py --kernel richardnguyen1991/mddcc     --local-store ./_localstore --kernel-status complete --dry-run
+```
+
+### `kernel-metadata.json`
+
+```json
+"id": "richardnguyen1991/mddcc",
+"dataset_sources": ["dungnguyen28101991/cicddos2019-parquet"],
+"enable_internet": true, "enable_gpu": false, "accelerator": "none", "is_private": true
+```
+
+**Dòng `dataset_sources` là lỗi hay gặp nhất khi tự động hoá bằng `kaggle kernels push`.**
+Thiếu nó thì session do GitHub Actions khởi động sẽ **không có dataset**, notebook chết ngay
+ở bước đọc dữ liệu và vòng lặp restart quay vô ích cho tới khi chạm `max_restarts`. Ô code
+đầu tiên của notebook vì thế kiểm tra `/kaggle/input` và fail-fast kèm thông báo chỉ đúng
+nguyên nhân này.
+
+### Notebook
+
+`kernel/kaggle_notebook.ipynb` được **sinh ra từ `scripts/build_notebook.py`**, không sửa
+JSON bằng tay — JSON notebook rất dễ hỏng và không review được trong diff. Có test kiểm tra
+file `.ipynb` không lệch khỏi script sinh nó.
+
+Tám ô code: fail-fast dataset → clone repo → cài phụ thuộc → đọc secret → in trạng thái
+trước → train → đánh giá cuối (chỉ khi đủ 100 epoch) → in trạng thái sau.
+
+Notebook **idempotent**: chỉ gọi `RunRegistry.get()`, không bao giờ tự tạo `run_id` mới —
+có test khẳng định `new_run_id` không xuất hiện trong notebook.
+
+Nếu `data.kaggle_input_dir` trong config không tồn tại (Kaggle đổi cấu trúc mount), notebook
+tự dò lại đường dẫn thật, ghi ra `configs/mddcc.runtime.yaml` và dùng file đó — thay vì chết.
+
+### Xử lý `KAGGLE_API_TOKEN` hai dạng
+
+Secret này có thể là **chuỗi key thuần** hoặc **toàn bộ nội dung `kaggle.json`**. Workflow tự
+nhận dạng: thử `json.loads` trước, nếu ra dict có khoá `key` thì dùng luôn; nếu không thì
+ghép với `KAGGLE_USERNAME`. Ghi ra `~/.kaggle/kaggle.json` với `chmod 600`.
+
+### Hai lưu ý về cron
+
+GitHub **tự tắt cron sau 60 ngày** repo không hoạt động, và cron chỉ chạy "best effort" nên
+có thể trễ vài phút. Với ngân sách ~39 session × 11h20m thì cả hai đều không gây vấn đề —
+workflow chỉ cần bắt được thời điểm kernel vừa kết thúc, và mỗi lần push đều tạo commit
+activity gián tiếp qua Issue/Actions log.
 
 ---
 
