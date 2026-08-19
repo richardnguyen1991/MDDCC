@@ -8,12 +8,6 @@ Wavelet DB4 (SWT, level 3) → 4 nhánh CNN độc lập → compose cộng → 
 loss `MSE + λ·Σσ(w)`, huấn luyện trên **CIC-DDoS2019** (Parquet) bằng **Kaggle CPU**,
 checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 
-> ⚠️ README này mô tả trạng thái hiện tại của pipeline. Hướng dẫn chạy lại đầy đủ
-> (kể cả bước thêm secret trên Kaggle và cách khôi phục khi run hỏng) sẽ hoàn thiện
-> ở Bước 6 theo thứ tự bàn giao.
-
----
-
 ## Trạng thái bàn giao
 
 | Bước | Nội dung | Trạng thái |
@@ -26,7 +20,8 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 | 3 | `model.py`, `train.py`, `checkpoint.py`, `s3io.py` (resume giữa epoch từ S3) | ✅ xong |
 | 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ✅ xong |
 | 5 | `kernel/`, `.github/workflows/run-kaggle.yml`, chống vòng lặp vô hạn | ✅ xong |
-| 6 | README đầy đủ, chạy thử 2 epoch + kiểm tra resume, rồi chạy đủ 100 epoch | ⏳ chưa làm |
+| 6 | README đầy đủ, script diễn tập resume, script nghiệm thu | ✅ xong |
+| — | **Chạy đủ 100 epoch trên Kaggle** | ⏳ chờ thực hiện |
 
 ---
 
@@ -334,119 +329,128 @@ Run thật **bắt buộc** dùng S3 — pipeline in cảnh báo khi không th�
 
 ---
 
-## Chạy
+## Chạy lại toàn bộ pipeline từ đầu
 
-```bash
-# Cài phụ thuộc (Kaggle đã có sẵn torch/numpy/sklearn/pyarrow)
-pip install -r requirements.txt
+### Bước 0 — chuẩn bị một lần
 
-# Bước 2a — discovery (chạy trên Kaggle, có mount dataset)
-python scripts/discover_dataset.py --config configs/mddcc.yaml --count-labels
-
-# Bước 2b — dựng cache + toàn bộ artifact cấu hình
-python -m src.data --config configs/mddcc.yaml --out-dir artifacts
-
-# Bước 3 — huấn luyện (S3 thật)
-python -m src.train --config configs/mddcc.yaml
-
-# Chạy thử không cần AWS
-python -m src.train --config configs/mddcc.yaml     --input-dir <parquet> --cache-dir <tmp> --local-store <dir> --max-epochs 2
-
-# Bước 4 — đánh giá cuối (chạy SAU khi xong 100 epoch)
-python -m src.evaluate --config configs/mddcc.yaml
-
-# Sinh lại toàn bộ hình + CSV từ artifact, không train lại
-python make_report.py --run-dir s3://$S3_BUCKET/$S3_PREFIX/<run_id> --upload
-
-# Test
-python -m pytest tests -q
-```
-
-```bash
-# Bước 5 — sinh lại notebook sau khi sửa build_notebook.py
-python scripts/build_notebook.py
-
-# Push kernel bằng tay (thường để GitHub Actions làm)
-kaggle kernels push -p kernel/
-```
-
-> `--max-epochs` **chỉ dùng để chạy thử**. Run chính luôn lấy `train.epochs = 100`
-> từ config và dừng chính xác ở epoch 100.
-
-> Trên Windows, nếu `C:\Users\<user>\AppData\Local\Temp` bị chặn quyền, chạy
-> `python -m pytest tests -q --basetemp=<thư-mục-ghi-được>`.
-
----
-
-## Tự động hoá: GitHub Actions → Kaggle
-
-### Luồng quyết định
-
-`scripts/kaggle_orchestrator.py` chứa toàn bộ logic; workflow chỉ gọi nó. Hàm `decide()` là
-**hàm thuần** không đọc/ghi gì, nên test được từng nhánh:
-
-| Trạng thái | Quyết định |
-|---|---|
-| `current_epoch ≥ 100` hoặc `status=completed` | `DONE` — không push nữa |
-| kernel `running` / `queued` | `WAIT` — không đụng vào |
-| kernel `complete` / `error` / `cancelAcknowledged`, epoch < 100 | `PUSH` — mở session mới |
-| chưa có `training_state.json` | `PUSH` — khởi động run đầu tiên |
-| **3 lần push liên tiếp mà `current_epoch` đứng yên** | `ABORT` + mở GitHub Issue |
-| `restarts ≥ max_restarts` (60) | `ABORT` |
-
-`max_restarts = 60` vì ngân sách đo được là **39 session**, cộng biên an toàn.
-
-Đã dry-run thật ba tình huống với `LocalStore`: epoch 37/100 + kernel `complete` → `PUSH`;
-kernel `running` → `WAIT`; ba lần push liên tiếp đứng yên ở epoch 37 → `ABORT`.
-
-```bash
-# Thử logic quyết định không cần AWS
-python scripts/kaggle_orchestrator.py --kernel richardnguyen1991/mddcc     --local-store ./_localstore --kernel-status complete --dry-run
-```
-
-### `kernel-metadata.json`
+**AWS.** Tạo bucket, và tạo **IAM user riêng** (không dùng root) với policy:
 
 ```json
-"id": "richardnguyen1991/mddcc",
-"dataset_sources": ["dungnguyen28101991/cicddos2019-parquet"],
-"enable_internet": true, "enable_gpu": false, "accelerator": "none", "is_private": true
+{"Version": "2012-10-17", "Statement": [{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+  "Resource": "arn:aws:s3:::<BUCKET>/<PREFIX>/*"
+}, {
+  "Effect": "Allow", "Action": ["s3:ListBucket"],
+  "Resource": "arn:aws:s3:::<BUCKET>",
+  "Condition": {"StringLike": {"s3:prefix": ["<PREFIX>/*"]}}
+}]}
 ```
 
-**Dòng `dataset_sources` là lỗi hay gặp nhất khi tự động hoá bằng `kaggle kernels push`.**
-Thiếu nó thì session do GitHub Actions khởi động sẽ **không có dataset**, notebook chết ngay
-ở bước đọc dữ liệu và vòng lặp restart quay vô ích cho tới khi chạm `max_restarts`. Ô code
-đầu tiên của notebook vì thế kiểm tra `/kaggle/input` và fail-fast kèm thông báo chỉ đúng
-nguyên nhân này.
+**Kaggle.** Tạo notebook trống với slug `richardnguyen1991/mddcc` (hoặc đổi `id` trong
+`kernel/kernel-metadata.json` và secret `KAGGLE_KERNEL` cho khớp). Gắn dataset
+`dungnguyen28101991/cicddos2019-parquet`. **Không cần thêm secret nào trên Kaggle.**
 
-### Notebook
+**GitHub.** Settings → Secrets and variables → Actions, thêm 7 secret (xem mục Secrets).
 
-`kernel/kaggle_notebook.ipynb` được **sinh ra từ `scripts/build_notebook.py`**, không sửa
-JSON bằng tay — JSON notebook rất dễ hỏng và không review được trong diff. Có test kiểm tra
-file `.ipynb` không lệch khỏi script sinh nó.
+### Bước 1 — diễn tập cục bộ trước khi cam kết 18 ngày
 
-Tám ô code: fail-fast dataset → clone repo → cài phụ thuộc → đọc secret → in trạng thái
-trước → train → đánh giá cuối (chỉ khi đủ 100 epoch) → in trạng thái sau.
+```bash
+pip install -r requirements.txt
+python -m pytest tests -q                       # 242 test
+python scripts/rehearse_resume.py --work-dir /tmp/mddcc_rehearsal
+```
 
-Notebook **idempotent**: chỉ gọi `RunRegistry.get()`, không bao giờ tự tạo `run_id` mới —
-có test khẳng định `new_run_id` không xuất hiện trong notebook.
+Script diễn tập chạy trên dữ liệu tổng hợp nhưng đi **đúng đường** mà run thật đi: train →
+bị `time_guard` ngắt giữa epoch 1 → chạy lại → phải tiếp từ đúng step kế tiếp → hoàn thành
+epoch 2 → đánh giá cuối → sinh 14 hình → kiểm tra 12 tiêu chí nghiệm thu. Thoát khác 0 nếu
+có bất kỳ khâu nào sai.
 
-Nếu `data.kaggle_input_dir` trong config không tồn tại (Kaggle đổi cấu trúc mount), notebook
-tự dò lại đường dẫn thật, ghi ra `configs/mddcc.runtime.yaml` và dùng file đó — thay vì chết.
+Nếu diễn tập không đạt, **đừng khởi động Kaggle** — sửa lỗi trước.
 
-### Xử lý `KAGGLE_API_TOKEN` hai dạng
+### Kết quả diễn tập (cục bộ, 2026-08-19)
 
-Secret này có thể là **chuỗi key thuần** hoặc **toàn bộ nội dung `kaggle.json`**. Workflow tự
-nhận dạng: thử `json.loads` trước, nếu ra dict có khoá `key` thì dùng luôn; nếu không thì
-ghép với `KAGGLE_USERNAME`. Ghi ra `~/.kaggle/kaggle.json` với `chmod 600`.
+```
+Bước 1: bị cắt giữa epoch 1 sau 4 step
+   status=interrupted / time_guard, current_epoch=0, history rỗng
+Bước 2: resume
+   run_id GIỮ NGUYÊN mddcc_20260819-0932, session_id mới, restart_count=1
+   history = [1, 2], epoch 1 đánh dấu partial + resumed_after_batches=4
+Bước 4: 14/14 hình PNG
+Bước 5: PASS 10 | FAIL 1 | SKIP 1 / 12
+```
 
-### Hai lưu ý về cron
+`FAIL` ở tiêu chí 9 là **đúng như thiết kế**: diễn tập dùng `epochs=2, batch_size=256`
+nên verifier bắt được ngay rằng đây không phải cấu hình run thật. `SKIP` ở tiêu chí 3
+vì chưa chạy qua GitHub Actions.
 
-GitHub **tự tắt cron sau 60 ngày** repo không hoạt động, và cron chỉ chạy "best effort" nên
-có thể trễ vài phút. Với ngân sách ~39 session × 11h20m thì cả hai đều không gây vấn đề —
-workflow chỉ cần bắt được thời điểm kernel vừa kết thúc, và mỗi lần push đều tạo commit
-activity gián tiếp qua Issue/Actions log.
+Tiêu chí 6 đáng chú ý nhất: `final_model_epoch_100.pt` nạp lại độc lập, dự đoán lại toàn
+bộ tập test và khớp `y_prob.npy` đã lưu với sai lệch tối đa **dưới 1e-5** — bằng chứng
+tính tái lập của cả chuỗi model → SWT → dự đoán.
+
+
+### Bước 2 — khởi động run thật
+
+Chạy workflow **run-kaggle** trên GitHub (tab Actions → Run workflow). Lần đầu nên bật
+`dry_run` để xem quyết định trước khi thật sự push:
+
+```
+==> PUSH: chua co training_state -> khoi dong run dau tien
+```
+
+Rồi chạy lại với `dry_run` tắt. Từ đó cron 30 phút tự lo: mỗi lần kernel kết thúc mà chưa
+đủ 100 epoch, workflow sinh STS token mới, tiêm vào notebook và push session tiếp theo.
+
+**Theo dõi:** đọc `training_state.json` trên S3, hoặc xem log step *Điều phối* trong Actions.
+
+### Bước 3 — nghiệm thu
+
+```bash
+python scripts/verify_acceptance.py     --run-dir s3://$S3_BUCKET/$S3_PREFIX/<run_id>     --with-data --config configs/mddcc.yaml
+```
+
+In bảng PASS/FAIL/SKIP cho 12 tiêu chí mục 11.A. `SKIP` nghĩa là **chưa đủ dữ liệu để kết
+luận**, không đồng nghĩa đã đạt.
+
+### Bước 4 — sinh lại hình cho luận văn
+
+```bash
+python make_report.py --run-dir s3://$S3_BUCKET/$S3_PREFIX/<run_id> --upload
+```
+
+Sửa nhãn/màu trong `src/viz.py` rồi chạy lại — **không cần train lại**.
 
 ---
+
+## Khôi phục khi run hỏng
+
+| Triệu chứng | Nguyên nhân thường gặp | Cách xử lý |
+|---|---|---|
+| Actions mở Issue "tự động khởi động lại đã bị dừng" | 3 lần push liên tiếp mà `current_epoch` đứng yên | Đọc log kernel trên Kaggle. Sửa nguyên nhân, đặt lại `status` trong `training_state.json` thành `interrupted`, chạy lại workflow |
+| Notebook chết ở ô 1 | `dataset_sources` thiếu, hoặc dataset bị xoá | Kiểm tra `kernel/kernel-metadata.json` |
+| Notebook chết ở ô 4 "credential đã hết hạn" | Kernel xếp hàng quá lâu, token 16h hết trước khi chạy | Tăng `STS_DURATION_SECONDS` trong workflow |
+| Notebook chết ở ô 4b "thiếu ..." | Chạy tay trên UI mà chưa tiêm credential | Dùng `scripts/prepare_kernel_push.py`, hoặc chạy qua workflow |
+| `feature_schema_hash lệch` | Đã đổi tập cột giữa hai session | **Không** train lại từ đầu. Hoặc khôi phục đúng config cũ, hoặc xoá `current_run_id.json` để bắt đầu `run_id` MỚI |
+| `history.json không liên tục` | Ghi đè do can thiệp tay | Đối chiếu `history.json` với `training_state.json`; `history` là append-only, không được sửa tay |
+| Session hết giờ mà chưa xong epoch nào | `cache_build_seconds` quá lớn | Xem `data_profile.json`; nếu dựng cache tốn gần hết session thì phải giảm dữ liệu hoặc tăng `interval_steps` |
+| Muốn bắt đầu lại hoàn toàn | | Xoá `current_run_id.json` trên S3. Run cũ vẫn nguyên dưới `run_id` của nó |
+
+**Không bao giờ** sửa tay `history.json` hay `training_state.json` để "chữa" một run —
+pipeline fail-fast chính là để anh biết có gì sai, không phải để lách qua.
+
+---
+
+## Sau khi xong 100 epoch
+
+`summary_metrics.json` chứa toàn bộ chỉ số mục 5. Ba con số cần đọc trước tiên:
+
+- **Macro-F1** — chỉ số chính, vì Accuracy bão hoà sớm trên dữ liệu mất cân bằng 1:45.746
+- **F1 của `WebDDoS`** — lớp hiếm nhất, chỉ ~132 mẫu trong test; đừng diễn giải quá mức
+- **BinaryFPR** — so trực tiếp với 8,18% mà bài báo ghi nhận
+
+Nếu Macro-F1 thấp hoặc mô hình suy biến về lớp đa số, xem panel (d) của hình C1
+(`grad_norm` và `σ(w)`) để chẩn đoán, rồi **tạo một `run_id` riêng** cho biến thể —
+không sửa run chính. Ứng viên đầu tiên là `lambda_std: 0.1` (xem mục chẩn đoán ở trên).
 
 ## Phân vai lưu trữ — không được nhầm lẫn
 
