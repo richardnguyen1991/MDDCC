@@ -22,7 +22,7 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 | 2a | Discovery Kaggle Dataset (`scripts/discover_dataset.py`) | ✅ xong — **đã chạy thật trên Kaggle 2026-08-18** |
 | 2b | `data.py`, `wavelet.py`, chống rò rỉ split, loại cột, test SWT | ✅ xong |
 | 2c | `stage1_switch_stats.py` — công thức (1)(2)(3) + 3-sigma (§3.G) | ✅ xong — **ngoài phạm vi đánh giá** |
-| — | **Tổng test** | **60/60 pass** |
+| — | **Tổng test** | **65/65 pass** |
 | 3 | `model.py`, `train.py`, `checkpoint.py` (resume giữa epoch từ S3) | ⏳ chưa làm |
 | 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ⏳ chưa làm |
 | 5 | `kernel/`, `.github/workflows/run-kaggle.yml` | ⏳ chưa làm |
@@ -59,7 +59,7 @@ Toàn bộ siêu tham số nằm trong [`configs/mddcc.yaml`](configs/mddcc.yaml
 |---|---|
 | Train step (bs=4096, fwd+bwd+SGD) | 1,441 s → **2.842 mẫu/s** |
 | Eval step (forward, `no_grad`) | 0,523 s → **7.825 mẫu/s** |
-| Dataset | 70.427.637 hàng, 18 file Parquet (2,88 GB), 19 lớp, 1 schema duy nhất |
+| Dataset | 70.427.637 hàng, 18 file Parquet (2,88 GB), **18 lớp** (sau gộp), 1 schema duy nhất |
 | Split | train 41,9M / val 7,4M / test 21,1M |
 | 1 epoch | train 4,10 h + val 0,26 h = **4,36 h** (10.231 step) |
 | **100 epoch** | **436 h ≈ 18 ngày → 39 session Kaggle 11h20m** |
@@ -113,7 +113,8 @@ vi phạm ràng buộc. Với `F = 81` hiện tại thì `S = 10` đã an toàn,
 
 ## Phân bố lớp thật (discovery 2026-08-18)
 
-19 lớp, mất cân bằng **1 : 45.746** giữa `TFTP` và `WebDDoS`:
+Dữ liệu thô có 19 nhãn; sau khi gộp `UDP-lag` → `UDPLag` còn **18 lớp**,
+mất cân bằng **1 : 45.746** giữa `TFTP` và `WebDDoS`:
 
 | Lớp | Số mẫu | % | | Lớp | Số mẫu | % |
 |---|---:|---:|---|---|---:|---:|
@@ -121,10 +122,10 @@ vi phạm ràng buộc. Với `F = 81` hiện tại thì `S = 10` đã an toàn,
 | Syn | 6.473.789 | 9,19 | | DrDoS_LDAP | 2.179.930 | 3,10 |
 | MSSQL | 5.787.453 | 8,22 | | LDAP | 1.915.122 | 2,72 |
 | DrDoS_SNMP | 5.159.870 | 7,33 | | DrDoS_NTP | 1.202.642 | 1,71 |
-| DrDoS_DNS | 5.071.011 | 7,20 | | UDP-lag | 366.461 | 0,52 |
+| DrDoS_DNS | 5.071.011 | 7,20 | | UDPLag † | 368.334 | 0,52 |
 | DrDoS_MSSQL | 4.522.492 | 6,42 | | Portmap | 186.960 | 0,27 |
 | DrDoS_NetBIOS | 4.093.279 | 5,81 | | **BENIGN** | **113.828** | **0,16** |
-| UDP | 3.867.155 | 5,49 | | UDPLag | 1.873 | 0,003 |
+| UDP | 3.867.155 | 5,49 | | | | |
 | NetBIOS | 3.657.497 | 5,19 | | **WebDDoS** | **439** | **0,0006** |
 | DrDoS_UDP | 3.134.645 | 4,45 | | | | |
 
@@ -132,12 +133,47 @@ Ba lớp cần theo dõi riêng khi đọc kết quả:
 
 - **`WebDDoS` chỉ có 439 mẫu.** Chia 59,5/10,5/30 → khoảng 261 train / 46 val / 132 test.
   Macro-F1 của lớp này sẽ rất nhiễu; đừng diễn giải quá mức một con số dựa trên 132 mẫu.
-- **`UDPLag` (1.873) và `UDP-lag` (366.461) là hai nhãn khác nhau** trong cùng dataset —
-  gần như chắc chắn là cùng một loại tấn công bị đặt tên khác giữa hai ngày thu thập
-  (`01-12` và `03-11`). Ta **giữ nguyên 19 lớp**, không tự gộp, nhưng nhầm lẫn giữa hai
-  lớp này trong confusion matrix là kỳ vọng được chứ không phải lỗi mô hình.
+- **† `UDPLag` = `UDP-lag` (366.461) + `UDPLag` (1.873) = 368.334.** Dữ liệu thô có hai
+  nhãn riêng cho cùng một loại tấn công, do hai ngày thu thập (`01-12` và `03-11`) đặt tên
+  khác nhau. Đã gộp theo yêu cầu — xem mục "Gộp nhãn" bên dưới.
 - **`BENIGN` chỉ chiếm 0,16%.** Binary view (BENIGN vs ATTACK) để so Table 9 vì thế cực kỳ
   mất cân bằng — đúng lý do bài báo ghi nhận FPR 8,18%.
+
+---
+
+## Gộp nhãn `UDP-lag` → `UDPLag`
+
+CIC-DDoS2019 chứa **hai nhãn khác nhau cho cùng một loại tấn công**: ngày `01-12` ghi
+`UDP-lag` (366.461 mẫu), ngày `03-11` ghi `UDPLag` (1.873 mẫu). Pipeline gộp chúng trước
+khi đánh mã lớp → **18 lớp** thay vì 19.
+
+Khai báo trong [`configs/mddcc.yaml`](configs/mddcc.yaml), không hardcode:
+
+```yaml
+data:
+  label:
+    merge_map:
+      "UDP-lag": "UDPLag"     # đặt {} để giữ nguyên 19 lớp như dữ liệu thô
+```
+
+Việc gộp diễn ra ở `scan_labels()`, **trước** khi chia tập — nên phân tầng, `sample_manifest`
+và mọi metric đều nhất quán trên 18 lớp. `label_mapping.json` ghi lại đầy đủ để truy nguyên:
+
+```json
+"label_merge": {
+  "applied": true,
+  "map": {"UDP-lag": "UDPLag"},
+  "merged_into": {"UDPLag": ["UDP-lag"]},
+  "raw_counts_before_merge": {"UDP-lag": 366461, "UDPLag": 1873, ...}
+}
+```
+
+Nếu `merge_map` trỏ tới một nhãn không tồn tại trong dữ liệu, pipeline **fail-fast** thay vì
+âm thầm bỏ qua — tránh trường hợp gõ sai tên nhãn mà vẫn chạy như không có gì.
+
+> Đây là **sai khác so với dataset gốc**, đã ghi vào `deviations_from_paper`. Khi báo cáo
+> kết quả phải nêu rõ số lớp là 18 và lý do gộp, vì Macro-F1 trên 18 lớp không so trực tiếp
+> được với một công bố khác dùng 19 lớp.
 
 ---
 

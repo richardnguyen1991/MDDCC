@@ -165,6 +165,8 @@ class LabelIndex:
     classes: list[str]
     codes: np.ndarray            # int16 [N], code theo vi tri trong classes
     benign_class: str = "BENIGN"
+    merge_map: dict[str, str] = field(default_factory=dict)
+    raw_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def num_classes(self) -> int:
@@ -179,7 +181,7 @@ class LabelIndex:
         return {name: int(c[i]) for i, name in enumerate(self.classes)}
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "classes": self.classes,
             "num_classes": self.num_classes,
             "benign_class": self.benign_class,
@@ -188,6 +190,21 @@ class LabelIndex:
             "binary_view": {"BENIGN": [self.benign_class],
                             "ATTACK": [c for c in self.classes if c != self.benign_class]},
         }
+        if self.merge_map:
+            # Ghi lai day du de truy nguoc: nhan nao bi gop vao dau, va so mau
+            # cua tung nhan GOC truoc khi gop.
+            merged_into: dict[str, list[str]] = {}
+            for src, dst in self.merge_map.items():
+                merged_into.setdefault(dst, []).append(src)
+            d["label_merge"] = {
+                "applied": True,
+                "map": dict(self.merge_map),
+                "merged_into": {k: sorted(v) for k, v in merged_into.items()},
+                "raw_counts_before_merge": self.raw_counts,
+                "note": "Gop nhan la SAI KHAC so voi dataset goc - xem "
+                        "deviations_from_paper trong run_config.json.",
+            }
+        return d
 
 
 def _iter_label_chunks(fp: Path, label_column: str):
@@ -208,22 +225,43 @@ def _iter_label_chunks(fp: Path, label_column: str):
 
 
 def scan_labels(files: Sequence[Path], schema: FeatureSchema,
-                row_counts: Sequence[int]) -> LabelIndex:
+                row_counts: Sequence[int],
+                merge_map: dict[str, str] | None = None) -> LabelIndex:
     """Doc RIENG cot nhan. Ket qua: mang int16 [N] = 141 MB voi 70.4M hang.
 
-    Luot 1 gom tap lop (chi doc tu vung cua tung chunk).
+    Luot 1 gom tap lop (chi doc tu vung cua tung chunk) va dem nhan GOC.
     Luot 2 anh xa ve ma toan cuc. Doc cot nhan hai lan van re hon nhieu so voi
     giu ca cot duoi dang chuoi Python.
+
+    merge_map gop nhan dong nghia truoc khi danh ma, vi du
+    {"UDP-lag": "UDPLag"} khi cung mot loai tan cong bi dat ten khac giua cac
+    ngay thu thap. So mau cua tung nhan GOC van duoc giu lai de truy nguoc.
     """
     total = int(sum(row_counts))
+    merge_map = dict(merge_map or {})
 
     vocab_all: set[str] = set()
+    raw_counts: dict[str, int] = {}
     for fp in files:
-        for vocab, _ in _iter_label_chunks(fp, schema.label_column):
-            vocab_all.update(vocab)
+        for vocab, idx in _iter_label_chunks(fp, schema.label_column):
+            vocab_all.update(merge_map.get(v, v) for v in vocab)
+            if idx.size:
+                seen = np.bincount(idx, minlength=len(vocab))
+                for v, n in zip(vocab, seen):
+                    raw_counts[v] = raw_counts.get(v, 0) + int(n)
         LOG.info("  quet nhan: %s", fp.name)
 
+    unknown = set(merge_map) - set(raw_counts)
+    if unknown:
+        raise RuntimeError(
+            f"label.merge_map tro toi nhan khong ton tai trong du lieu: {sorted(unknown)}. "
+            f"Nhan co that: {sorted(raw_counts)}"
+        )
+
     classes = sorted(vocab_all)
+    if merge_map:
+        LOG.info("  gop nhan: %s -> con %d lop (truoc khi gop: %d)",
+                 merge_map, len(classes), len(raw_counts))
     if len(classes) > np.iinfo(np.int16).max:
         raise RuntimeError(f"{len(classes)} lop - vuot suc chua int16")
     global_lut = {c: i for i, c in enumerate(classes)}
@@ -233,8 +271,10 @@ def scan_labels(files: Sequence[Path], schema: FeatureSchema,
     for fp, n_expected in zip(files, row_counts):
         start = pos
         for vocab, idx in _iter_label_chunks(fp, schema.label_column):
-            # anh xa chi so cuc bo -> ma toan cuc bang mot mang tra cuu nho
-            local_to_global = np.array([global_lut[v] for v in vocab], dtype=np.int16)
+            # anh xa chi so cuc bo -> ma toan cuc bang mot mang tra cuu nho,
+            # ap dung merge_map ngay tai day
+            local_to_global = np.array(
+                [global_lut[merge_map.get(v, v)] for v in vocab], dtype=np.int16)
             codes[pos:pos + idx.size] = local_to_global[idx]
             pos += idx.size
         if pos - start != n_expected:
@@ -246,7 +286,8 @@ def scan_labels(files: Sequence[Path], schema: FeatureSchema,
     benign = next((c for c in classes if c.upper() == "BENIGN"), None)
     if benign is None:
         raise RuntimeError(f"Khong thay lop BENIGN trong {classes} - can cho binary view (muc 3.E)")
-    return LabelIndex(classes, codes, benign)
+    return LabelIndex(classes, codes, benign, merge_map=merge_map,
+                      raw_counts=dict(sorted(raw_counts.items())))
 
 
 # ------------------------------------------------------------------ split
@@ -743,7 +784,8 @@ def prepare_dataset(cfg: dict, out_dir: Path, *, files=None) -> PreparedData:
 
     schema = discover_schema(files, cfg)
     assert_schema_consistent(files, schema)
-    labels = scan_labels(files, schema, rc)
+    labels = scan_labels(files, schema, rc,
+                         merge_map=dcfg["label"].get("merge_map") or {})
 
     groups = None
     if cfg["split"].get("group_aware"):

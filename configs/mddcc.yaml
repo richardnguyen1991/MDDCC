@@ -32,6 +32,13 @@ data:
     strip_column_whitespace: true
     infer_from_path_if_missing: true    # suy tu ten file / ten thu muc
     fail_if_undetermined: true
+    # Gop nhan dong nghia TRUOC khi danh ma lop. CIC-DDoS2019 co ca "UDP-lag"
+    # (366,461 mau, ngay 01-12) lan "UDPLag" (1,873 mau, ngay 03-11) - cung mot
+    # loai tan cong bi dat ten khac giua hai ngay thu thap. Gop -> 18 lop.
+    # Day la SAI KHAC so voi dataset goc, xem deviations_from_paper.
+    # Dat {} de giu nguyen 19 lop nhu du lieu tho.
+    merge_map:
+      "UDP-lag": "UDPLag"
 
   # Cot dinh danh / ro ri (3.B) - mac dinh XOA
   drop_identifier_columns: true
@@ -263,4 +270,5 @@ deviations_from_paper:
   stage1: {paper: "co, chay tren Mininet/POX", ours: "ngoai pham vi, chi implement + unit test", reason: "khong co moi truong SDN"}
   regularization: {paper: "Table 3 ghi L2, ly thuyet dung sigma(w)", ours: "sigma(w), weight_decay=0", reason: "ly thuyet la dong gop chinh"}
   pool_ceil_mode: {paper: "khong neu", ours: "true", reason: "da duyet - tranh feature map sup ve 1x1 (32 -> 128 chieu truoc FC)"}
-  swt_caching: {paper: "khong neu", ours: "SWT on-the-fly, chi cache feature da scale", reason: "cache subband 91.3 GB vuot dia Kaggle; chi phi chi ~5%/epoch"}
+  swt_caching: {paper: "khong neu", ours: "SWT on-the-fly, chi cache feature da scale", reason: "cache subband 112.7 GB vuot dia Kaggle; chi phi chi ~5%/epoch"}
+  label_merge: {paper: "chu yeu nhi phan nen khong gap", ours: "gop UDP-lag vao UDPLag -> 18 lop thay vi 19", reason: "cung mot loai tan cong bi dat ten khac giua ngay 01-12 va 03-11 cua CIC-DDoS2019"}

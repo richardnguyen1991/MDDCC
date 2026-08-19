@@ -379,3 +379,80 @@ def test_prepare_dataset_applies_pruning_end_to_end(tmp_path, cfg):
     mm = np.load(p.cache_path, mmap_mode="r")
     assert mm.shape[1] == p.schema.n_features
     assert p.geom.n_features == p.schema.n_features
+
+
+# --------------------------------------------------- gop nhan dong nghia (3.E)
+def _labelled_parquet(tmp_path, labels_seq):
+    """Tao parquet voi day nhan cho truoc, du cot de discover_schema chay duoc."""
+    out = tmp_path / "data"
+    out.mkdir(parents=True, exist_ok=True)
+    rows = len(labels_seq)
+    rng = np.random.default_rng(0)
+    cols = {f" Feat{i}": pa.array(rng.normal(i, 1 + i, rows)) for i in range(4)}
+    cols[" Label"] = pa.array(list(labels_seq))
+    p = out / "p.parquet"
+    pq.write_table(pa.table(cols), p)
+    return [p]
+
+
+def test_merge_map_collapses_synonym_labels(tmp_path, cfg):
+    files = _labelled_parquet(
+        tmp_path, ["BENIGN"] * 10 + ["UDP-lag"] * 30 + ["UDPLag"] * 5 + ["Syn"] * 20)
+    s = D.discover_schema(files, cfg)
+    rc = D.row_counts_of(files)
+
+    raw = D.scan_labels(files, s, rc)
+    assert raw.num_classes == 4
+    assert raw.counts()["UDP-lag"] == 30 and raw.counts()["UDPLag"] == 5
+
+    merged = D.scan_labels(files, s, rc, merge_map={"UDP-lag": "UDPLag"})
+    assert merged.num_classes == 3, "gop xong phai con 3 lop"
+    assert "UDP-lag" not in merged.classes
+    assert merged.counts()["UDPLag"] == 35, "so mau phai cong don"
+    assert merged.counts()["BENIGN"] == 10 and merged.counts()["Syn"] == 20
+
+
+def test_merge_preserves_raw_counts_for_traceability(tmp_path, cfg):
+    files = _labelled_parquet(
+        tmp_path, ["BENIGN"] * 10 + ["UDP-lag"] * 30 + ["UDPLag"] * 5)
+    s = D.discover_schema(files, cfg)
+    m = D.scan_labels(files, s, D.row_counts_of(files),
+                      merge_map={"UDP-lag": "UDPLag"})
+
+    info = m.to_dict()["label_merge"]
+    assert info["applied"] is True
+    assert info["map"] == {"UDP-lag": "UDPLag"}
+    assert info["merged_into"] == {"UDPLag": ["UDP-lag"]}
+    assert info["raw_counts_before_merge"] == {"BENIGN": 10, "UDP-lag": 30, "UDPLag": 5}
+
+
+def test_no_merge_key_when_map_empty(tmp_path, cfg):
+    files = _labelled_parquet(tmp_path, ["BENIGN"] * 5 + ["Syn"] * 5)
+    s = D.discover_schema(files, cfg)
+    m = D.scan_labels(files, s, D.row_counts_of(files), merge_map={})
+    assert "label_merge" not in m.to_dict(), "khong gop thi khong ghi khoa nay"
+
+
+def test_merge_map_with_unknown_label_fails_fast(tmp_path, cfg):
+    files = _labelled_parquet(tmp_path, ["BENIGN"] * 5 + ["Syn"] * 5)
+    s = D.discover_schema(files, cfg)
+    with pytest.raises(RuntimeError, match="khong ton tai"):
+        D.scan_labels(files, s, D.row_counts_of(files),
+                      merge_map={"KhongCoLop": "Syn"})
+
+
+def test_merged_labels_flow_through_prepare_dataset(tmp_path, cfg):
+    files = _labelled_parquet(
+        tmp_path, (["BENIGN"] * 40 + ["UDP-lag"] * 60 + ["UDPLag"] * 20 + ["Syn"] * 80) * 5)
+    cfg["data"]["kaggle_input_dir"] = str(tmp_path / "data")
+    cfg["data"]["cache_dir"] = str(tmp_path / "cache")
+    cfg["data"]["parquet_glob"] = "**/*.parquet"
+    cfg["data"]["label"]["merge_map"] = {"UDP-lag": "UDPLag"}
+
+    p = D.prepare_dataset(cfg, tmp_path / "artifacts")
+    assert p.labels.num_classes == 3
+    lm = p.artifacts["label_mapping.json"]
+    assert lm["num_classes"] == 3
+    assert lm["counts"]["UDPLag"] == 400          # (60 + 20) * 5
+    assert lm["label_merge"]["applied"] is True
+    assert set(lm["binary_view"]["ATTACK"]) == {"UDPLag", "Syn"}
