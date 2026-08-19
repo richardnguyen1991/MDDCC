@@ -22,7 +22,7 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 | 2a | Discovery Kaggle Dataset (`scripts/discover_dataset.py`) | ✅ xong — **đã chạy thật trên Kaggle 2026-08-18** |
 | 2b | `data.py`, `wavelet.py`, chống rò rỉ split, loại cột, test SWT | ✅ xong |
 | 2c | `stage1_switch_stats.py` — công thức (1)(2)(3) + 3-sigma (§3.G) | ✅ xong — **ngoài phạm vi đánh giá** |
-| — | **Tổng test** | **180/180 pass** |
+| — | **Tổng test** | **183/183 pass** |
 | 3 | `model.py`, `train.py`, `checkpoint.py`, `s3io.py` (resume giữa epoch từ S3) | ✅ xong |
 | 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ✅ xong |
 | 5 | `kernel/`, `.github/workflows/run-kaggle.yml` | ⏳ chưa làm |
@@ -296,10 +296,12 @@ bài báo nhấn mạnh cho phát hiện thời gian thực.
   (trước SWT)** rồi tính lại SWT. Hoán vị trực tiếp trên subband đã biến đổi sẽ vô nghĩa vì
   một cột gốc ảnh hưởng tới cả 4 subband qua bộ lọc wavelet. Test kiểm tra dữ liệu được trả
   lại nguyên trạng sau mỗi cột.
-- **SHAP** `GradientExplainer`, quy đóng góp từ 4 subband về feature gốc bằng cách cộng
-  `|SHAP|` theo vị trí rồi **bỏ các vị trí padding**. Tính theo chunk, cộng dồn, không giữ
-  tensor `[sample, class, feature]` trong RAM. Thiếu thư viện `shap` thì bỏ qua C13 kèm
-  cảnh báo, không làm hỏng cả bước đánh giá.
+- **SHAP** `GradientExplainer` (đã xác minh với `shap==0.52.0`), quy đóng góp từ 4 subband
+  về feature gốc bằng cách cộng `|SHAP|` theo vị trí rồi **bỏ các vị trí padding**. Tính
+  theo chunk, cộng dồn, không giữ tensor `[sample, class, feature]` trong RAM. Số mẫu thực
+  tế đã dùng được ghi vào `shap_meta.json` — nếu yêu cầu nhiều hơn số mẫu có sẵn thì tự
+  giảm và báo đúng con số. Thiếu thư viện `shap` thì bỏ qua C13 kèm cảnh báo, không làm
+  hỏng cả bước đánh giá.
 - **Branch ablation** zero-out lần lượt `cD1/cD2/cD3/cA3`, đo mức giảm Macro-F1 — bằng
   chứng định lượng cho đóng góp của phân rã wavelet đa mức.
 - `feature_importance_comparison.csv` giữ **riêng** `rank_permutation` và `rank_shap` kèm cờ
@@ -335,6 +337,9 @@ Run thật **bắt buộc** dùng S3 — pipeline in cảnh báo khi không th�
 ## Chạy
 
 ```bash
+# Cài phụ thuộc (Kaggle đã có sẵn torch/numpy/sklearn/pyarrow)
+pip install -r requirements.txt
+
 # Bước 2a — discovery (chạy trên Kaggle, có mount dataset)
 python scripts/discover_dataset.py --config configs/mddcc.yaml --count-labels
 

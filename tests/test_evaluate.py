@@ -259,3 +259,55 @@ def test_benchmark_separates_scale_swt_and_forward():
             assert e[part]["p50_ms"] >= 0 and e[part]["p95_ms"] >= e[part]["p50_ms"]
         assert e["throughput_samples_per_s"] > 0
         assert 0 <= e["swt_share_percent"] <= 100
+
+
+# --------------------------------------------------------- SHAP that (7.J3)
+def test_shap_maps_subbands_back_to_raw_features():
+    """Chay voi thu vien shap THAT: 4 subband -> feature goc, bo padding."""
+    shap = pytest.importorskip("shap")
+
+    torch.manual_seed(0)
+    g, m = geom_and_model(n_features=24, num_classes=4)
+    raw = np.random.default_rng(0).random((240, 24))
+    names = [f"f{i}" for i in range(24)]
+
+    rows, meta = X.shap_importance(m, raw, g, names, max_samples=100,
+                                   background=25, chunk=40)
+    assert meta["skipped"] is False
+    assert meta["n_samples_used"] == 100 and meta["n_background"] == 25
+    assert len(rows) == len(names), "phai quy ve DUNG so feature goc, khong phai S*S"
+    assert {r["rank_shap"] for r in rows} == set(range(1, len(names) + 1))
+    assert sum(r["shap_percent"] for r in rows) == pytest.approx(100.0, abs=1e-6)
+    assert all(r["mean_abs_shap"] >= 0 for r in rows)
+
+
+def test_shap_downscales_when_asked_for_more_than_available():
+    """Muc 7.J5: tu giam sample size va ghi ro so mau THUC TE da dung."""
+    pytest.importorskip("shap")
+
+    g, m = geom_and_model(n_features=24, num_classes=4)
+    raw = np.random.default_rng(1).random((60, 24))
+    rows, meta = X.shap_importance(m, raw, g, [f"f{i}" for i in range(24)],
+                                   max_samples=5000, background=200, chunk=30)
+    assert meta["n_samples_used"] == 60, "phai bao so mau THUC TE"
+    assert meta["requested_samples"] == 5000
+    assert len(rows) == 24
+
+
+def test_shap_missing_library_is_not_fatal(monkeypatch):
+    """Thieu shap thi bo qua C13 kem canh bao, khong lam hong buoc danh gia."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **kw):
+        if name == "shap":
+            raise ImportError("gia lap thieu shap")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    g, m = geom_and_model()
+    rows, meta = X.shap_importance(m, np.zeros((10, 24)), g,
+                                   [f"f{i}" for i in range(24)])
+    assert rows == [] and meta["skipped"] is True
+    assert "shap" in meta["reason"]
