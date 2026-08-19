@@ -337,10 +337,30 @@ báo cáo như đã tái hiện đủ.
 
 ## Rủi ro đang theo dõi
 
-`MSE + Softmax + SGD lr=0.001` hội tụ chậm hơn nhiều so với `CrossEntropy + Adam`.
-Nếu sau 100 epoch Macro-F1 thấp hoặc mô hình suy biến về lớp đa số, kết quả sẽ được
-báo cáo đúng như vậy kèm panel `grad_norm` / `σ(w)` làm bằng chứng chẩn đoán —
-không tự ý đổi loss/optimizer/lr giữa chừng.
+### Smoke test 25 epoch đã cho thấy dấu hiệu suy biến
+
+Chạy thử trên dữ liệu tổng hợp (24.000 hàng, 81 cột, 4 lớp tỷ lệ .1/.4/.4/.1, trong đó
+20 cột mang tín hiệu thật nên **bài toán chắc chắn học được**), cấu hình đúng như run chính:
+
+| epoch | train MSE | train Macro-F1 | **val Macro-F1** | val Acc | grad_norm | Σσ(w) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0,7879 | 0,1592 | 0,1415 | 0,3948 | 0,828 | 1,0638 |
+| 10 | 0,6689 | 0,2231 | 0,1432 | 0,4012 | 0,325 | 1,0555 |
+| 18 | 0,6632 | 0,2205 | 0,1432 | 0,4012 | 0,281 | 1,0485 |
+| 25 | 0,6623 | 0,2217 | **0,1432** | 0,4012 | 0,290 | 1,0423 |
+
+`val_macro_f1` đứng yên hoàn toàn. Con số 0,1432 không ngẫu nhiên: nếu mô hình luôn dự đoán
+một lớp chiếm 0,4 thì `acc = 0,40` và `macro-F1 = 2×0,4/1,4 ÷ 4 = 0,143` — khớp chính xác.
+**Mô hình suy biến về lớp đa số** và MSE bão hoà từ khoảng epoch 14.
+
+Đây đúng là rủi ro mục 11.C đã cảnh báo: `MSE + Softmax + SGD lr=0.001` hội tụ chậm hơn
+nhiều so với `CrossEntropy + Adam`. Cần lưu ý smoke test chỉ có 56 step/epoch, trong khi
+run thật có **10.231 step/epoch** — nhiều hơn ~180 lần số lần cập nhật gradient, nên chưa
+thể kết luận chắc chắn cho run thật.
+
+**Không tự ý đổi loss/optimizer/lr giữa chừng.** Nếu sau 100 epoch Macro-F1 vẫn thấp,
+kết quả sẽ được báo cáo đúng như vậy kèm panel `grad_norm` / `σ(w)` (hình C1 panel d) làm
+bằng chứng chẩn đoán, rồi mới đề xuất một `run_id` RIÊNG cho biến thể — không thay run chính.
 
 Dùng tất cả feature + không xử lý mất cân bằng → FPR có thể cao như bài báo đã ghi nhận
 (8,18% trên CIC-DDoS2019). Đây là kết quả cần báo cáo, không phải lỗi cần "sửa".
