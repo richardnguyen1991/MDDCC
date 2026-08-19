@@ -75,12 +75,13 @@ def test_train_does_not_import_matplotlib():
         assert bad not in code, f"train.py co tham chieu {bad!r}"
 
 
-def test_figures_are_closed_not_leaked():
+def test_figures_are_closed_not_leaked(tmp_path):
     """Muc 7.B2: plt.close(fig) sau moi hinh, khong giu figure toan cuc."""
     import matplotlib.pyplot as plt
 
     before = len(plt.get_fignums())
-    viz.plot_lr_schedule(fake_history(), Path("."), RUN_ID, 6)
+    # Ghi vao tmp_path, KHONG vao "." - neu khong se rai hinh vao goc repo
+    viz.plot_lr_schedule(fake_history(), tmp_path, RUN_ID, 6)
     assert len(plt.get_fignums()) == before, "figure bi ro ri"
 
 

@@ -27,5 +27,11 @@ credentials*
 # Artifact sinh ra khi chay - song tren S3, khong song trong git
 /figures/
 /metrics/
+/report/
 *.pt
 *.log
+
+# Hinh sinh ra o goc repo (thuong la do test ghi nham vao ".")
+/*.png
+/*.pdf
+/*.csv
