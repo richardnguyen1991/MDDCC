@@ -131,7 +131,7 @@ loss:
 # --------------------------------------------------------------- OPTIM (2.D)
 optim:
   name: sgd                       # mini-batch GD + BP dung bai bao
-  learning_rate: 0.001            # hang so suot 100 epoch (bai bao dung 0.01)
+  learning_rate: 0.01             # hang so suot 100 epoch - DUNG THEO BAI BAO
   momentum: 0.0
   nesterov: false
   weight_decay: 0.0               # da co sigma(w)
@@ -267,7 +267,7 @@ stage1_switch_stats:
 
 # ------------------------------------------- SAI KHAC SO VOI BAI BAO (11.B)
 deviations_from_paper:
-  learning_rate: {paper: "0.01", ours: "0.001", reason: "yeu cau thi nghiem"}
+  # learning_rate: DA KHOP BAI BAO (0.01) tu 2026-08-19, khong con la sai khac.
   batch_size: {paper: "khong neu", ours: "4096", reason: "throughput CPU"}
   stopping: {paper: "dung khi loss khong giam", ours: "du 100 epoch, khong early stopping", reason: "yeu cau cua toi"}
   feature_set: {paper: "48/80+", ours: "TAT CA feature tru cot dinh danh", reason: "de danh cho thi nghiem sau"}

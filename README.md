@@ -22,7 +22,7 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 | 2a | Discovery Kaggle Dataset (`scripts/discover_dataset.py`) | ✅ xong — **đã chạy thật trên Kaggle 2026-08-18** |
 | 2b | `data.py`, `wavelet.py`, chống rò rỉ split, loại cột, test SWT | ✅ xong |
 | 2c | `stage1_switch_stats.py` — công thức (1)(2)(3) + 3-sigma (§3.G) | ✅ xong — **ngoài phạm vi đánh giá** |
-| — | **Tổng test** | **118/118 pass** |
+| — | **Tổng test** | **134/134 pass** |
 | 3 | `model.py`, `train.py`, `checkpoint.py`, `s3io.py` (resume giữa epoch từ S3) | ✅ xong |
 | 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ⏳ chưa làm |
 | 5 | `kernel/`, `.github/workflows/run-kaggle.yml` | ⏳ chưa làm |
@@ -38,7 +38,7 @@ Toàn bộ siêu tham số nằm trong [`configs/mddcc.yaml`](configs/mddcc.yaml
 |---|---|---|
 | epochs | **100 chính xác**, không early stopping | yêu cầu thí nghiệm |
 | batch_size | 4096 | yêu cầu thí nghiệm |
-| learning_rate | 0.001 hằng số, không scheduler | yêu cầu thí nghiệm (bài báo: 0.01) |
+| learning_rate | **0.01** hằng số, không scheduler | **đúng bài báo** |
 | optimizer | SGD, `momentum=0`, `weight_decay=0` | bài báo |
 | loss | MSE(softmax, one-hot) + `λ_std=1.0 · Σ σ(w)` | công thức (8)(9) |
 | wavelet | DB4, level 3, **SWT** (không downsampling) | mục "Two-stage attack detection" |
@@ -325,9 +325,12 @@ giới hạn trong `arn:aws:s3:::$S3_BUCKET/$S3_PREFIX/*`.
 
 Bảng đầy đủ nằm ở mục `deviations_from_paper` trong
 [`configs/mddcc.yaml`](configs/mddcc.yaml) và sẽ được ghi vào `run_config.json` mỗi run.
-Các điểm chính: learning rate 0.001 (bài báo 0.01), dùng tất cả feature (bài báo chọn 48),
-chạy đủ 100 epoch không early stopping, chỉ dùng CIC-DDoS2019, chạy CPU,
-`pool_ceil_mode=true`, và SWT tính on-the-fly thay vì cache subband.
+Các điểm chính: dùng tất cả feature (bài báo chọn 48), chạy đủ 100 epoch không early
+stopping, chỉ dùng CIC-DDoS2019, chạy CPU, `pool_ceil_mode=true`, SWT tính on-the-fly
+thay vì cache subband, và gộp `UDP-lag` → `UDPLag`.
+
+**Learning rate đã đổi về 0.01 đúng bài báo (2026-08-19)** — trước đó dùng 0.001 theo yêu
+cầu thí nghiệm. Đây không còn là sai khác.
 
 **Giai đoạn 1 của bài báo (thống kê cổng switch SDN với ngưỡng 3-sigma) và module giảm
 thiểu dựa trên đồ thị KHÔNG được đánh giá** vì CIC-DDoS2019 không chứa số liệu cổng switch
@@ -336,6 +339,34 @@ implement đúng công thức (1)(2)(3) kèm unit test trên dữ liệu tổng 
 báo cáo như đã tái hiện đủ.
 
 ## Rủi ro đang theo dõi
+
+### Chẩn đoán: vì sao đổi learning rate về 0.01
+
+Trên cùng dữ liệu tổng hợp, 15 epoch, tách riêng ảnh hưởng của `λ` và `lr`:
+
+| Biến thể | train MSE | train F1 | **val Macro-F1** | val Acc |
+|---|---:|---:|---:|---:|
+| λ=1.0, lr=0.001 | 0,6648 | 0,2185 | **0,1432** | 0,4012 |
+| λ=0.0, lr=0.001 | 0,6647 | 0,2190 | **0,1432** | 0,4012 |
+| λ=1.0, lr=0.01 | 0,6515 | 0,2650 | **0,2570** | 0,5083 |
+| λ=0.0, lr=0.01 | 0,6436 | 0,2798 | **0,3803** | 0,6865 |
+| λ=0.1, lr=0.01 | 0,6445 | 0,2780 | **0,3745** | 0,6770 |
+
+Hai điều đọc được:
+
+1. **Ở `lr=0.001`, bật hay tắt `σ(w)` cho kết quả giống hệt nhau** (0,1432 / 0,4012, MSE
+   lệch 0,0001). Regularizer hoàn toàn vô can — nút thắt là learning rate. Nâng lên 0,01
+   thì Macro-F1 nhảy 0,1432 → 0,2570.
+2. **Nhưng `λ=1.0` vẫn đắt**: ở `lr=0.01` nó làm mất một phần ba Macro-F1
+   (0,2570 so với 0,3803). `λ=0.1` lấy lại gần hết (0,3745) mà vẫn giữ cơ chế `σ(w)`.
+
+Điểm (1) là lý do đổi `lr` về 0,01. Điểm (2) **chưa xử lý** — `λ=1.0` là giá trị mặc định
+theo công thức (9) và giữ nguyên cho run chính. Nếu sau 100 epoch Macro-F1 thấp, `λ=0.1`
+là ứng viên đầu tiên cho một `run_id` biến thể riêng.
+
+> Cảnh báo về quy mô: chẩn đoán này chỉ có 56 step/epoch, run thật có **10.231 step/epoch**.
+> Với SGD không momentum, `lr` nhỏ được bù bằng số bước — nên bảng trên **không** chứng minh
+> `lr=0.001` sai ở quy mô thật, chỉ chứng minh nó chậm hơn nhiều ở cùng số bước.
 
 ### Smoke test 25 epoch đã cho thấy dấu hiệu suy biến
 
