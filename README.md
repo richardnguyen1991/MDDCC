@@ -22,8 +22,8 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 | 2a | Discovery Kaggle Dataset (`scripts/discover_dataset.py`) | ✅ xong — **đã chạy thật trên Kaggle 2026-08-18** |
 | 2b | `data.py`, `wavelet.py`, chống rò rỉ split, loại cột, test SWT | ✅ xong |
 | 2c | `stage1_switch_stats.py` — công thức (1)(2)(3) + 3-sigma (§3.G) | ✅ xong — **ngoài phạm vi đánh giá** |
-| — | **Tổng test** | **65/65 pass** |
-| 3 | `model.py`, `train.py`, `checkpoint.py` (resume giữa epoch từ S3) | ⏳ chưa làm |
+| — | **Tổng test** | **118/118 pass** |
+| 3 | `model.py`, `train.py`, `checkpoint.py`, `s3io.py` (resume giữa epoch từ S3) | ✅ xong |
 | 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ⏳ chưa làm |
 | 5 | `kernel/`, `.github/workflows/run-kaggle.yml` | ⏳ chưa làm |
 | 6 | README đầy đủ, chạy thử 2 epoch + kiểm tra resume, rồi chạy đủ 100 epoch | ⏳ chưa làm |
@@ -222,6 +222,54 @@ Tái hiện đầy đủ cần môi trường Mininet/POX, nằm ngoài phạm v
 
 ---
 
+## Loss: `MSE + λ·Σσ(w)` và một chỗ mơ hồ của bài báo
+
+Công thức (8) được cài đúng nguyên văn — `σ(ω) = sqrt( (1/nk)Σω² − ((1/nk)Σω)² )`
+tính trên **toàn bộ `nk` phần tử** của ma trận trọng số từng lớp conv/fc, **không tính bias**.
+Lưu ý đây là độ lệch chuẩn tổng thể (`ddof=0`), không phải `torch.std` mặc định (`ddof=1`);
+test khoá lại điều này.
+
+Nhưng bài báo chỉ viết *"we use the mean squared error as the loss function"* và công thức (9)
+là `L = min_ω {f(X,y:ω) + λσ(ω)}` — **không định nghĩa cách rút gọn MSE**. Với 13 lớp
+(4 nhánh × 3 conv + 1 FC), `Σσ(w) ≈ 1.064` lúc khởi tạo. Đo thực tế:
+
+| `mse_reduction` | MSE | `λ·Σσ(w)` | Tỷ lệ |
+|---|---:|---:|---:|
+| `mean_elements` (`nn.MSELoss` mặc định) | 0,0527 | 1,0639 | **20,2×** |
+| `mean_batch_sum_class` | 0,9493 | 1,0639 | **1,1×** |
+
+Chọn **`mean_batch_sum_class`** — chế độ duy nhất mà regularizer không át loss chính.
+Với `mean_elements`, `σ(w)` chiếm 95% tổng loss và gradient sẽ chủ yếu kéo trọng số về
+phía đồng đều thay vì học phân loại. Đây là quyết định kỹ thuật giải quyết chỗ mơ hồ của
+bài báo, không phải sai khác — nhưng đã ghi vào `run_config.json` để đối chiếu, và đổi được
+qua config nếu muốn chạy biến thể.
+
+`history.json` ghi tách riêng `train_mse_loss` và `train_std_reg` mỗi epoch (mục 2.C) để
+kiểm chứng liên tục rằng regularizer không lấn át.
+
+---
+
+## Chống mất session
+
+| Cơ chế | Cài đặt |
+|---|---|
+| Checkpoint theo epoch **và** theo step | mỗi `checkpoint.interval_steps` (mặc định 200) |
+| Upload an toàn | ghi key `_tmp/` → kiểm tra size + sha256 → copy → xoá tmp. Session bị cắt giữa lúc upload thì key chính vẫn nguyên vẹn |
+| Resume giữa epoch | bỏ qua `steps_done_in_epoch` batch đầu của permutation đã seed theo `(seed, epoch)` |
+| Kiểm tra hash | `params_hash`, `feature_schema_hash`, `scaler_hash` — lệch thì **fail-fast**, không âm thầm train lại từ đầu |
+| `run_id` cố định | `current_run_id.json` trên S3; session sau đọc lại đúng run |
+| Thoát chủ động | còn 20 phút → lưu checkpoint + history + state, `exit_reason="time_guard"`, exit 0 |
+| `history.json` | append-only, kiểm tra epoch liên tục 1..n mỗi lần resume |
+
+Epoch bị resume giữa chừng được đánh dấu `train_metrics_partial: true` kèm
+`resumed_after_batches` — vì metric train của epoch đó chỉ tính trên phần batch chạy trong
+session sau, không phải cả epoch. Không đánh dấu thì learning curve sẽ bị đọc nhầm.
+
+`LocalStore` cho phép chạy thử toàn bộ pipeline không cần AWS (`--local-store <dir>`).
+Run thật **bắt buộc** dùng S3 — pipeline in cảnh báo khi không thấy `S3_BUCKET`.
+
+---
+
 ## Chạy
 
 ```bash
@@ -231,9 +279,18 @@ python scripts/discover_dataset.py --config configs/mddcc.yaml --count-labels
 # Bước 2b — dựng cache + toàn bộ artifact cấu hình
 python -m src.data --config configs/mddcc.yaml --out-dir artifacts
 
+# Bước 3 — huấn luyện (S3 thật)
+python -m src.train --config configs/mddcc.yaml
+
+# Chạy thử không cần AWS
+python -m src.train --config configs/mddcc.yaml     --input-dir <parquet> --cache-dir <tmp> --local-store <dir> --max-epochs 2
+
 # Test
 python -m pytest tests -q
 ```
+
+> `--max-epochs` **chỉ dùng để chạy thử**. Run chính luôn lấy `train.epochs = 100`
+> từ config và dừng chính xác ở epoch 100.
 
 > Trên Windows, nếu `C:\Users\<user>\AppData\Local\Temp` bị chặn quyền, chạy
 > `python -m pytest tests -q --basetemp=<thư-mục-ghi-được>`.

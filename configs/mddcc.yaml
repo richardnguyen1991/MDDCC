@@ -113,6 +113,14 @@ model:
 # ---------------------------------------------------------------- LOSS (2.C)
 loss:
   name: mse                       # MSE(softmax, one-hot) - KHONG CrossEntropy o run chinh
+  # Bai bao chi viet "we use the mean squared error", cong thuc (9) la
+  # L = min_w {f(X,y:w) + lambda*sigma(w)} - KHONG dinh nghia cach rut gon MSE.
+  # Do duoc luc khoi tao (F=81 -> S=10, 18 lop, lambda=1.0):
+  #   mean_elements        -> mse 0.0527, std_reg 1.0639  => reg gap 20.2x mse
+  #   mean_batch_sum_class -> mse 0.9493, std_reg 1.0639  => reg gap  1.1x mse
+  # Chon mean_batch_sum_class: day la che do duy nhat ma regularizer khong lan at
+  # loss chinh. Doi sang mean_elements de chay bien the doi chung.
+  mse_reduction: mean_batch_sum_class   # mean_batch_sum_class | mean_elements
   std_regularizer:
     enabled: true                 # sigma(w), cong thuc (8)(9)
     lambda_std: 1.0
