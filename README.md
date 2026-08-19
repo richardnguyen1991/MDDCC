@@ -22,9 +22,9 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 | 2a | Discovery Kaggle Dataset (`scripts/discover_dataset.py`) | ✅ xong — **đã chạy thật trên Kaggle 2026-08-18** |
 | 2b | `data.py`, `wavelet.py`, chống rò rỉ split, loại cột, test SWT | ✅ xong |
 | 2c | `stage1_switch_stats.py` — công thức (1)(2)(3) + 3-sigma (§3.G) | ✅ xong — **ngoài phạm vi đánh giá** |
-| — | **Tổng test** | **134/134 pass** |
+| — | **Tổng test** | **180/180 pass** |
 | 3 | `model.py`, `train.py`, `checkpoint.py`, `s3io.py` (resume giữa epoch từ S3) | ✅ xong |
-| 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ⏳ chưa làm |
+| 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ✅ xong |
 | 5 | `kernel/`, `.github/workflows/run-kaggle.yml` | ⏳ chưa làm |
 | 6 | README đầy đủ, chạy thử 2 epoch + kiểm tra resume, rồi chạy đủ 100 epoch | ⏳ chưa làm |
 
@@ -249,6 +249,68 @@ kiểm chứng liên tục rằng regularizer không lấn át.
 
 ---
 
+## Báo cáo và giải thích
+
+### `make_report.py` chạy độc lập
+
+```bash
+python make_report.py --run-dir s3://bucket/prefix/mddcc_20260819-0251 --upload
+python make_report.py --run-dir ./_localstore/mddcc_20260819-0251
+```
+
+Sinh lại **đủ 14 hình C1–C14** cùng CSV chỉ từ artifact đã lưu, **không cần train lại** —
+đã kiểm chứng bằng chạy thật. Lý do tồn tại: Kaggle cắt session bất kỳ lúc nào, và khi cần
+sửa nhãn/màu hình cho luận văn thì không được phép huấn luyện lại 39 session.
+
+Mỗi hình xuất **đồng thời 3 file**: `.png` (300 dpi), `.pdf` (vector), `.csv` (dữ liệu đúng
+như đã vẽ). Hình nào thiếu dữ liệu đầu vào thì bị bỏ qua kèm cảnh báo, không làm hỏng cả
+báo cáo.
+
+### Bước đánh giá cuối là một bước RIÊNG BIỆT
+
+```bash
+python -m src.evaluate --config configs/mddcc.yaml
+```
+
+Chỉ chạy được khi `training_state.json` báo `is_complete` — chưa đủ 100 epoch thì fail-fast.
+Nếu bước này lỗi, checkpoint vẫn nguyên trên S3 và chạy lại được bằng chính lệnh đó.
+Idempotent: seed cố định, giữ nguyên thứ tự test, không lấy mẫu ngẫu nhiên cho metric chính.
+
+### Chi phí wavelet được bóc tách (mục 6)
+
+Đây là điểm khác biệt cốt lõi của MDDCC nên `t_swt` không được giấu trong tổng thời gian.
+Đo trên CPU 4 luồng, `model.eval()` + `no_grad`, F=81 → S=10:
+
+| batch | `t_scale` | `t_swt` | `t_forward` | `t_total` p50 / p95 | throughput | SWT chiếm |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4096 | 3,59 ms | 29,65 ms | 395,91 ms | 427,64 / 438,64 ms | 9.578 mẫu/s | **6,93%** |
+| 1 | 0,04 ms | 0,17 ms | 1,99 ms | 2,20 / 3,13 ms | 454 mẫu/s | **7,55%** |
+
+Hai điều đáng chú ý: phân rã wavelet chỉ chiếm ~7% thời gian suy luận, phần còn lại là
+forward pass của 4 nhánh CNN. Và độ trễ ở `batch=1` là **2,2 ms**, thoả yêu cầu < 100 ms mà
+bài báo nhấn mạnh cho phát hiện thời gian thực.
+
+### Đo mức độ quan trọng của đặc trưng
+
+- **Permutation** là phương pháp chính: hoán vị từng cột **trên không gian feature gốc
+  (trước SWT)** rồi tính lại SWT. Hoán vị trực tiếp trên subband đã biến đổi sẽ vô nghĩa vì
+  một cột gốc ảnh hưởng tới cả 4 subband qua bộ lọc wavelet. Test kiểm tra dữ liệu được trả
+  lại nguyên trạng sau mỗi cột.
+- **SHAP** `GradientExplainer`, quy đóng góp từ 4 subband về feature gốc bằng cách cộng
+  `|SHAP|` theo vị trí rồi **bỏ các vị trí padding**. Tính theo chunk, cộng dồn, không giữ
+  tensor `[sample, class, feature]` trong RAM. Thiếu thư viện `shap` thì bỏ qua C13 kèm
+  cảnh báo, không làm hỏng cả bước đánh giá.
+- **Branch ablation** zero-out lần lượt `cD1/cD2/cD3/cA3`, đo mức giảm Macro-F1 — bằng
+  chứng định lượng cho đóng góp của phân rã wavelet đa mức.
+- `feature_importance_comparison.csv` giữ **riêng** `rank_permutation` và `rank_shap` kèm cờ
+  `top10_consensus`, **không** gộp hai thước đo thành một điểm.
+
+> SHAP và permutation thể hiện **đóng góp dự đoán**, không chứng minh quan hệ nhân quả.
+> Các đặc trưng tương quan mạnh có thể chia sẻ importance, làm cả hai cùng thấp một cách
+> giả tạo. Ghi chú này được lưu vào `explain_sample_manifest.json` của mỗi run.
+
+---
+
 ## Chống mất session
 
 | Cơ chế | Cài đặt |
@@ -284,6 +346,12 @@ python -m src.train --config configs/mddcc.yaml
 
 # Chạy thử không cần AWS
 python -m src.train --config configs/mddcc.yaml     --input-dir <parquet> --cache-dir <tmp> --local-store <dir> --max-epochs 2
+
+# Bước 4 — đánh giá cuối (chạy SAU khi xong 100 epoch)
+python -m src.evaluate --config configs/mddcc.yaml
+
+# Sinh lại toàn bộ hình + CSV từ artifact, không train lại
+python make_report.py --run-dir s3://$S3_BUCKET/$S3_PREFIX/<run_id> --upload
 
 # Test
 python -m pytest tests -q
