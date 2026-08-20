@@ -229,9 +229,13 @@ def run(cfg: dict, *, config_path: Path, local_store_root: Path | None = None,
     assert_cpu_only(cfg)
 
     store = store_from_env(cfg, local_root=local_store_root)
-    registry = RunRegistry(store)
+    from .config import run_id_key, variant_of
+
+    variant = variant_of(cfg)
+    registry = RunRegistry(store, key=run_id_key(cfg))
     run_id, is_new = registry.get_or_create(cfg["experiment"].get("run_id_prefix", "mddcc"))
-    LOG.info("run_id=%s (moi=%s) session_id=%s", run_id, is_new, session_id)
+    LOG.info("bien the=%s | run_id=%s (moi=%s) session_id=%s",
+             variant, run_id, is_new, session_id)
 
     # ---------------------------------------------------------------- du lieu
     work = Path(cfg["data"]["cache_dir"]).parent / "mddcc_work"
@@ -416,6 +420,7 @@ def _upload_run_config(writer, cfg, run_id, config_path, model, geom, schema,
 
     run_config = {
         "run_id": run_id,
+        "variant": cfg["experiment"].get("variant", "full"),
         "experiment_role": cfg["experiment"]["role"],
         "created_at_utc": utc_now(),
         "config_file": str(config_path),
@@ -476,6 +481,8 @@ def main(argv=None) -> int:
 
     ap = argparse.ArgumentParser(description="Huan luyen MDDCC")
     ap.add_argument("--config", type=Path, required=True)
+    ap.add_argument("--variant", default=None,
+                    help="Ten overlay trong configs/variants/ (vd capped10m)")
     ap.add_argument("--input-dir", type=Path, default=None)
     ap.add_argument("--cache-dir", type=Path, default=None)
     ap.add_argument("--local-store", type=Path, default=None,
@@ -486,7 +493,9 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     setup_logging(args.log_level)
-    cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    from .config import load_config
+
+    cfg = load_config(args.config, args.variant)
     if args.input_dir:
         cfg["data"]["kaggle_input_dir"] = str(args.input_dir)
     if args.cache_dir:

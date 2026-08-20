@@ -1,0 +1,41 @@
+# Bien the "capped10m" - chay SONG SONG voi run chinh (full).
+#
+# Chi ghi de nhung khoa KHAC configs/mddcc.yaml; phan con lai ke thua nguyen ven
+# nen khong bao gio bi lech khi sua config goc.
+#
+# Muc dich: co ket qua sau ~3 ngay thay vi ~20 ngay, de biet som MSE + SGD co
+# hoi tu khong, trong khi run full van chay song song.
+#
+#   python -m src.train --config configs/mddcc.yaml --variant capped10m
+
+experiment:
+  variant: capped10m
+  run_id_prefix: mddcc-capped10m
+
+data:
+  cache_dir: /kaggle/temp/mddcc_cache_capped10m
+  subsample:
+    # capped: giu TRON lop hiem, chan tran lop lon.
+    # Voi 18 lop va target 10M, tran roi vao khoang 700k-800k mau/lop:
+    # WebDDoS (439), UDPLag (368,334), Portmap (186,960), BENIGN (113,828)
+    # duoc giu nguyen ven; TFTP (20M), Syn (6.5M)... bi ha xuong tran.
+    mode: capped
+    target_rows: 10000000
+    seed: 42
+
+kaggle:
+  kernel_slug: mddcc-capped10m
+
+s3:
+  # Moi bien the co so ghi run_id RIENG, neu khong hai run se tranh nhau
+  current_run_id_key: variants/capped10m/current_run_id.json
+
+deviations_from_paper:
+  subsample:
+    paper: "dung toan bo du lieu"
+    ours: "lay mau chan tran ~10M hang, giu tron lop hiem"
+    reason: >-
+      Rut ngan tu ~20 ngay xuong ~3 ngay de co ket qua som. CANH BAO: chan tran
+      lop lon LA MOT DANG can thiep vao mat can bang, khac voi
+      imbalance_handling=none. FPR va binary view cua bien the nay KHONG so truc
+      tiep duoc voi Table 9 - dung run "full" cho viec do.

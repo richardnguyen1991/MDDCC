@@ -81,8 +81,13 @@ def encode(payload: dict) -> str:
         json.dumps(payload, separators=(",", ":")).encode("utf-8")).decode("ascii")
 
 
-def build_push_dir(out_dir: Path, credentials_b64: str) -> Path:
-    """Ghi notebook (da tiem credential) + kernel-metadata.json vao out_dir."""
+def build_push_dir(out_dir: Path, credentials_b64: str,
+                   variant: str = "full") -> Path:
+    """Ghi notebook (da tiem credential) + kernel-metadata.json vao out_dir.
+
+    Moi bien the co slug Kaggle RIENG, neu khong hai run song song se push de len
+    cung mot notebook va cuop session cua nhau.
+    """
     import build_notebook
 
     out_dir = Path(out_dir)
@@ -90,11 +95,23 @@ def build_push_dir(out_dir: Path, credentials_b64: str) -> Path:
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
 
-    nb = build_notebook.build(credentials_b64)
+    nb = build_notebook.build(credentials_b64, "" if variant == "full" else variant)
     (out_dir / "kaggle_notebook.ipynb").write_text(
         json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
-    shutil.copy2(REPO / "kernel" / "kernel-metadata.json",
-                 out_dir / "kernel-metadata.json")
+
+    meta = json.loads((REPO / "kernel" / "kernel-metadata.json")
+                      .read_text(encoding="utf-8"))
+    if variant and variant != "full":
+        from src.config import load_config
+
+        cfg = load_config(REPO / "configs" / "mddcc.yaml", variant)
+        slug = (cfg.get("kaggle", {}) or {}).get("kernel_slug")
+        if not slug:
+            raise SystemExit(f"Bien the {variant!r} thieu kaggle.kernel_slug")
+        meta["id"] = f"{meta['id'].split('/')[0]}/{slug}"
+        meta["title"] = f"MDDCC {variant}"
+    (out_dir / "kernel-metadata.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     # Xac minh credential that su da vao notebook
     body = (out_dir / "kaggle_notebook.ipynb").read_text(encoding="utf-8")
@@ -107,6 +124,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Dung thu muc kernel co credential tam thoi de push")
     ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--variant", default="full",
+                    help="full | ten overlay trong configs/variants/")
     ap.add_argument("--duration", type=int,
                     default=int(os.environ.get("STS_DURATION_SECONDS",
                                                DEFAULT_DURATION)))
@@ -116,9 +135,11 @@ def main(argv=None) -> int:
 
     b64 = "" if args.no_credentials else encode(
         get_temporary_credentials(args.duration))
-    out = build_push_dir(args.out_dir, b64)
+    out = build_push_dir(args.out_dir, b64, args.variant)
 
-    print(f"\nThu muc push: {out}")
+    meta = json.loads((out / "kernel-metadata.json").read_text(encoding="utf-8"))
+    print(f"\nBien the: {args.variant}  ->  kernel {meta['id']}")
+    print(f"Thu muc push: {out}")
     for p in sorted(out.iterdir()):
         print(f"  {p.name}  ({p.stat().st_size:,} byte)")
     if b64:

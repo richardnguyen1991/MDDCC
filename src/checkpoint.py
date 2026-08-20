@@ -307,22 +307,25 @@ class RunRegistry:
 
     KEY = "current_run_id.json"
 
-    def __init__(self, store: ObjectStore):
+    def __init__(self, store: ObjectStore, key: str | None = None):
+        # Moi bien the mot khoa RIENG. Neu hai run song song dung chung khoa nay
+        # thi chung se cuop run_id cua nhau va ghi de checkpoint len nhau.
         self.store = store
+        self.key = key or self.KEY
         self.writer = SafeWriter(store)
 
     def get_or_create(self, prefix: str = "mddcc") -> tuple[str, bool]:
-        d = self.store.get_json_or_none(self.KEY)
+        d = self.store.get_json_or_none(self.key)
         if d and d.get("run_id"):
             return d["run_id"], False
         run_id = new_run_id(prefix)
         self.writer.put_json(
-            {"run_id": run_id, "created_at_utc": utc_now()}, self.KEY)
+            {"run_id": run_id, "created_at_utc": utc_now()}, self.key)
         LOG.info("Tao run_id moi: %s", run_id)
         return run_id, True
 
     def get(self) -> str | None:
-        d = self.store.get_json_or_none(self.KEY)
+        d = self.store.get_json_or_none(self.key)
         return d.get("run_id") if d else None
 
 

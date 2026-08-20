@@ -16,11 +16,12 @@ checkpoint trên **AWS S3**, điều phối bằng **GitHub Actions**.
 | 2a | Discovery Kaggle Dataset (`scripts/discover_dataset.py`) | ✅ xong — **đã chạy thật trên Kaggle 2026-08-18** |
 | 2b | `data.py`, `wavelet.py`, chống rò rỉ split, loại cột, test SWT | ✅ xong |
 | 2c | `stage1_switch_stats.py` — công thức (1)(2)(3) + 3-sigma (§3.G) | ✅ xong — **ngoài phạm vi đánh giá** |
-| — | **Tổng test** | **242/242 pass** |
+| — | **Tổng test** | **253/253 pass** |
 | 3 | `model.py`, `train.py`, `checkpoint.py`, `s3io.py` (resume giữa epoch từ S3) | ✅ xong |
 | 4 | `evaluate.py`, `viz.py`, `make_report.py`, `explain.py` | ✅ xong |
 | 5 | `kernel/`, `.github/workflows/run-kaggle.yml`, chống vòng lặp vô hạn | ✅ xong |
 | 6 | README đầy đủ, script diễn tập resume, script nghiệm thu | ✅ xong |
+| 7 | Hai biến thể chạy song song (`full` + `capped10m`) | ✅ xong |
 | — | **Chạy đủ 100 epoch trên Kaggle** | ⏳ chờ thực hiện |
 
 ---
@@ -419,6 +420,70 @@ python make_report.py --run-dir s3://$S3_BUCKET/$S3_PREFIX/<run_id> --upload
 ```
 
 Sửa nhãn/màu trong `src/viz.py` rồi chạy lại — **không cần train lại**.
+
+---
+
+## Hai biến thể chạy song song
+
+Chạy đồng thời hai run độc lập để không phải chờ 20 ngày mới biết mô hình có hội tụ:
+
+| | `full` | `capped10m` |
+|---|---|---|
+| Dữ liệu | 70.427.637 hàng | **10.000.001** hàng, chặn trần |
+| `run_id` | `mddcc_…` | `mddcc-capped10m_…` |
+| Khoá S3 | `current_run_id.json` | `variants/capped10m/current_run_id.json` |
+| Kernel Kaggle | `richardnguyen1991/mddcc` | `richardnguyen1991/mddcc-capped10m` |
+| Cache | 22,8 GB, dựng lại ~8 phút/session | **3,2 GB, ~1 phút/session** |
+| Ngân sách | ~39 session, **~20 ngày** | ~6 session, **~3 ngày** |
+| So với Table 9 | ✅ so trực tiếp được | ❌ xem cảnh báo dưới |
+
+```bash
+python -m src.train --config configs/mddcc.yaml                      # full
+python -m src.train --config configs/mddcc.yaml --variant capped10m  # biến thể
+```
+
+### Cách tách hai run
+
+Pipeline ban đầu giả định chỉ có **một** run — hai run sẽ tranh nhau `current_run_id.json`
+và ghi đè checkpoint của nhau. Mỗi biến thể vì thế có `run_id`, khoá S3, kernel Kaggle và
+thư mục cache **riêng**. Workflow chạy `strategy.matrix` với `fail-fast: false` và
+`concurrency` khoá theo **từng** biến thể — khoá chung sẽ làm chúng xếp hàng chờ nhau vô ích.
+
+[`configs/variants/capped10m.yaml`](configs/variants/capped10m.yaml) chỉ ghi đè **7 khoá**,
+phần còn lại kế thừa từ `configs/mddcc.yaml` qua `deep_merge`. Copy thành hai file đầy đủ
+thì chắc chắn sẽ lệch nhau sau vài lần sửa; có test khẳng định `epochs`, `batch_size`,
+`learning_rate`, `optimizer`, `loss`, `wavelet.level` giống hệt nhau ở cả hai.
+
+### Lấy mẫu chặn trần làm gì
+
+`class_cap_for_target` tìm ngưỡng bằng tìm kiếm nhị phân sao cho `Σ min(countᵢ, c) ≈ 10M`.
+Với phân bố thật, ngưỡng là **666.460 mẫu/lớp**:
+
+| | Trước | Sau |
+|---|---:|---:|
+| Tổng | 70.427.637 | 10.000.001 (14,2%) |
+| `TFTP` | 20.082.580 | 666.460 |
+| `UDPLag` | 368.334 | **368.334** — giữ trọn |
+| `BENIGN` | 113.828 | **113.828** — giữ trọn |
+| `WebDDoS` | 439 | **439** — giữ trọn |
+| Mất cân bằng | 1 : 45.746 | 1 : 1.518 |
+
+Bốn lớp nhỏ nhất (`UDPLag`, `Portmap`, `BENIGN`, `WebDDoS`) **không mất mẫu nào**. Nếu lấy
+mẫu theo tỷ lệ tự nhiên thì `WebDDoS` chỉ còn ~62 mẫu và test còn ~19 — Macro-F1 lúc đó là
+nhiễu. Cache cũng chỉ dựng cho các hàng được chọn, nên nhỏ hơn 7 lần.
+
+> ⚠️ **`capped10m` KHÔNG so trực tiếp được với Table 9.** Chặn trần lớp lớn **là** một dạng
+> can thiệp vào mất cân bằng, khác với `imbalance_handling: none` mà bài báo dùng. FPR và
+> binary view của biến thể này không đối chiếu được với bài báo — dùng run `full` cho việc
+> đó. Cảnh báo này được ghi vào `deviations_from_paper` và `sample_manifest.json` của mỗi run.
+
+### Giới hạn session đồng thời của Kaggle
+
+Số session CPU chạy đồng thời mà tài khoản anh được phép là điều tôi **không kiểm chứng
+được** từ đây. Nếu chỉ được 1 session thì hai biến thể sẽ nối tiếp nhau chứ không thực sự
+song song, và tổng thời gian ≈ 20 + 3 ngày. Nên thử chạy tay hai notebook cùng lúc một lần
+để biết trước.
+
 
 ---
 

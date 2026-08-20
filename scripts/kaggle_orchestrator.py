@@ -153,6 +153,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Dieu phoi kernel Kaggle cho MDDCC")
     ap.add_argument("--kernel", default=os.environ.get("KAGGLE_KERNEL", ""))
     ap.add_argument("--kernel-dir", default="kernel")
+    ap.add_argument("--variant", default="full",
+                    help="full | ten overlay trong configs/variants/")
     ap.add_argument("--max-restarts", type=int,
                     default=int(os.environ.get("MAX_RESTARTS", DEFAULT_MAX_RESTARTS)))
     ap.add_argument("--dry-run", action="store_true",
@@ -167,8 +169,20 @@ def main(argv=None) -> int:
         raise SystemExit("Thieu KAGGLE_KERNEL (dang <username>/<slug>)")
 
     store = open_store(args.local_store)
+
+    # Moi bien the co khoa current_run_id RIENG. Neu doc nham khoa thi
+    # orchestrator se tuong bien the nay dang o epoch cua bien the kia.
+    from pathlib import Path as _P
+    import sys as _s
+    _s.path.insert(0, str(_P(__file__).resolve().parents[1]))
+    from src.config import load_config, run_id_key
+
+    cfg = load_config(_P(__file__).resolve().parents[1] / "configs" / "mddcc.yaml",
+                      None if args.variant == "full" else args.variant)
+    key = run_id_key(cfg)
+
     run_id = None
-    d = store.get_json_or_none("current_run_id.json")
+    d = store.get_json_or_none(key)
     if d:
         run_id = d.get("run_id")
 
@@ -183,6 +197,7 @@ def main(argv=None) -> int:
     else:
         rc, out = run(["kaggle", "kernels", "status", args.kernel])
         kernel_status = parse_kernel_status(out)
+    print(f"bien the      = {args.variant}  (khoa {key})")
     print(f"run_id        = {run_id}")
     print(f"kernel status = {kernel_status!r} (exit {rc})")
     if state:

@@ -211,7 +211,8 @@ def test_notebook_prints_state_before_and_after():
 
 def test_notebook_is_idempotent_does_not_force_new_run_id():
     """Lan chay thu N chi tiep tuc, khong tao run_id moi."""
-    assert "RunRegistry(store).get()" in ALL_CODE
+    assert "RunRegistry(store, key=run_id_key(cfg))" in ALL_CODE
+    assert "REGISTRY.get()" in ALL_CODE
     assert "new_run_id" not in ALL_CODE, "notebook khong duoc tu tao run_id moi"
 
 
@@ -246,9 +247,11 @@ def test_workflow_has_schedule_and_manual_trigger():
     assert "workflow_dispatch" in WF_TRIGGERS
 
 
-def test_workflow_concurrency_prevents_overlapping_pushes():
-    assert WF["concurrency"]["group"] == "mddcc-kaggle"
-    assert WF["concurrency"]["cancel-in-progress"] is False
+def test_workflow_concurrency_is_per_variant():
+    """Khoa theo TUNG bien the: khoa chung se lam hai bien the cho nhau vo ich."""
+    conc = WF["jobs"]["orchestrate"]["concurrency"]
+    assert conc["group"] == "mddcc-kaggle-${{ matrix.variant }}"
+    assert conc["cancel-in-progress"] is False
 
 
 def test_workflow_can_open_issues():
@@ -407,3 +410,104 @@ def test_prepare_script_refuses_root_credentials():
     """Khoa root chi duoc 3600s va cap quyen toan bo tai khoan."""
     src = (REPO / "scripts" / "prepare_kernel_push.py").read_text(encoding="utf-8")
     assert ":root" in src and "IAM user" in src
+
+
+# ================================ hai bien the chay song song (full + capped10m)
+import sys as _sys  # noqa: E402
+
+_sys.path.insert(0, str(REPO))
+from src.config import (available_variants, deep_merge, kernel_slug,  # noqa: E402
+                        load_config, run_id_key, variant_of)
+
+CFG_PATH = REPO / "configs" / "mddcc.yaml"
+
+
+def test_two_variants_are_available():
+    assert set(available_variants(CFG_PATH)) >= {"full", "capped10m"}
+
+
+def test_variant_overlay_only_changes_what_it_declares():
+    """Bien the ke thua moi thu tru vai khoa - khong duoc lech siêu tham so."""
+    full = load_config(CFG_PATH)
+    cap = load_config(CFG_PATH, "capped10m")
+    for section, key in [("train", "epochs"), ("train", "batch_size"),
+                         ("optim", "learning_rate"), ("optim", "name"),
+                         ("loss", "name"), ("wavelet", "level"),
+                         ("wavelet", "transform"), ("model", "compose")]:
+        assert full[section][key] == cap[section][key],             f"{section}.{key} lech giua hai bien the"
+
+
+def test_variants_never_share_run_id_key():
+    """Neu dung chung khoa nay, hai run se cuop run_id cua nhau."""
+    assert run_id_key(load_config(CFG_PATH)) != run_id_key(
+        load_config(CFG_PATH, "capped10m"))
+
+
+def test_variants_never_share_kernel_or_cache():
+    full, cap = load_config(CFG_PATH), load_config(CFG_PATH, "capped10m")
+    assert kernel_slug(full, "u") != kernel_slug(cap, "u")
+    assert full["data"]["cache_dir"] != cap["data"]["cache_dir"]
+    assert full["experiment"]["run_id_prefix"] != cap["experiment"]["run_id_prefix"]
+
+
+def test_full_variant_has_no_subsample():
+    """Run chinh phai giu tron du lieu - day la diem doi chieu voi Table 9."""
+    full = load_config(CFG_PATH)
+    assert (full["data"].get("subsample") or {}).get("mode", "none") == "none"
+    assert variant_of(full) == "full"
+
+
+def test_capped_variant_declares_the_deviation():
+    cap = load_config(CFG_PATH, "capped10m")
+    assert cap["data"]["subsample"]["mode"] == "capped"
+    assert cap["data"]["subsample"]["target_rows"] == 10_000_000
+    dev = cap["deviations_from_paper"]["subsample"]
+    assert "can thiep" in dev["reason"], "phai canh bao day la mot dang xu ly mat can bang"
+
+
+def test_unknown_variant_fails_fast():
+    with pytest.raises(SystemExit, match="Khong co bien the"):
+        load_config(CFG_PATH, "khong-ton-tai")
+
+
+def test_deep_merge_does_not_replace_whole_section():
+    base = {"a": {"x": 1, "y": 2}, "b": 3}
+    got = deep_merge(base, {"a": {"y": 99}})
+    assert got == {"a": {"x": 1, "y": 99}, "b": 3}
+    assert base["a"]["y"] == 2, "khong duoc sua dict goc"
+
+
+def test_workflow_runs_both_variants_without_fail_fast():
+    job = WF["jobs"]["orchestrate"]
+    assert job["strategy"]["matrix"]["variant"] == ["full", "capped10m"]
+    assert job["strategy"]["fail-fast"] is False,         "mot bien the hong khong duoc keo bien the kia dung"
+
+
+def test_workflow_passes_variant_to_both_scripts():
+    steps = WF["jobs"]["orchestrate"]["steps"]
+    prep = next(s for s in steps if s.get("name", "").startswith("Dung kernel"))
+    orch = next(s for s in steps if s.get("name", "").startswith("Dieu phoi"))
+    assert "--variant" in prep["run"] and "--variant" in orch["run"]
+    # kernel phai lay tu metadata cua bien the, khong dung thang secret
+    assert "steps.prepare.outputs.slug" in orch["run"]
+
+
+def test_prepare_kernel_push_gives_each_variant_its_own_slug(tmp_path):
+    import json as _json
+    import sys as _s
+
+    _s.path.insert(0, str(REPO / "scripts"))
+    import prepare_kernel_push as P
+
+    slugs = {}
+    for v in ("full", "capped10m"):
+        out = P.build_push_dir(tmp_path / v, "", v)
+        slugs[v] = _json.loads(
+            (out / "kernel-metadata.json").read_text(encoding="utf-8"))["id"]
+        nb = _json.loads((out / "kaggle_notebook.ipynb").read_text(encoding="utf-8"))
+        code = "\n".join("".join(c["source"]) for c in nb["cells"]
+                         if c["cell_type"] == "code")
+        expect = "__MDDCC_VARIANT__" if v == "full" else v
+        assert f'VARIANT = "{expect}"' in code
+    assert slugs["full"] != slugs["capped10m"]
+    assert slugs["capped10m"].endswith("/mddcc-capped10m")

@@ -127,6 +127,7 @@ han khong bao gio roi khoi GitHub.
 code('''# Chuoi nay do scripts/prepare_kernel_push.py thay the luc push.
 # Ban trong repo LUON rong - co test khang dinh dieu do.
 CREDENTIALS_B64 = "__MDDCC_CREDENTIALS_B64__"
+VARIANT = "__MDDCC_VARIANT__"
 
 INJECTED = {}
 if CREDENTIALS_B64 and not CREDENTIALS_B64.startswith("__MDDCC"):
@@ -207,10 +208,12 @@ md("## 5. Trang thai TRUOC khi chay")
 code('''import json
 from src.s3io import store_from_env
 from src.checkpoint import RunRegistry
+from src.config import load_config, run_id_key
 import yaml
 
 CFG_PATH = "configs/mddcc.yaml"
-cfg = yaml.safe_load(Path(CFG_PATH).read_text(encoding="utf-8"))
+_VARIANT = VARIANT if VARIANT and not VARIANT.startswith("__MDDCC") else None
+cfg = load_config(Path(CFG_PATH), _VARIANT)
 
 # Duong dan mount that co the khac config (Kaggle dat ten theo slug) -> ghi de
 cfg_dir = Path(cfg["data"]["kaggle_input_dir"])
@@ -222,7 +225,8 @@ if not cfg_dir.exists():
     CFG_PATH = "configs/mddcc.runtime.yaml"
 
 store = store_from_env(cfg)
-run_id = RunRegistry(store).get()
+REGISTRY = RunRegistry(store, key=run_id_key(cfg))
+run_id = REGISTRY.get()
 print(f"run_id truoc khi chay = {run_id}")
 if run_id:
     st = store.get_json_or_none(f"{run_id}/checkpoints/training_state.json") or {}
@@ -241,7 +245,9 @@ truoc khi Kaggle cat session (`time_guard`). Thoat code 0 la binh thuong -
 GitHub Actions se khoi dong session tiep theo.
 """)
 
-code('''rc = os.system(f"python -m src.train --config {CFG_PATH} 2>&1")
+code('''VARIANT_ARG = f" --variant {VARIANT}" if VARIANT and not VARIANT.startswith("__MDDCC") else ""
+print(f"Bien the: {VARIANT if VARIANT_ARG else 'full'}")
+rc = os.system(f"python -m src.train --config {CFG_PATH}{VARIANT_ARG} 2>&1")
 print(f"\\ntrain exit code = {rc}")
 if rc != 0:
     raise SystemExit(f"src.train that bai (rc={rc}) - xem log phia tren")''')
@@ -250,12 +256,12 @@ md("## 7. Danh gia cuoi (chi khi da du 100 epoch)")
 
 code('''# Muc 4.8 + 7.E5: buoc RIENG BIET. Neu buoc nay loi thi checkpoint van nguyen
 # tren S3 va chay lai duoc bang make_report.py.
-run_id = RunRegistry(store).get()
+run_id = REGISTRY.get()
 st = store.get_json_or_none(f"{run_id}/checkpoints/training_state.json") or {}
 
 if st.get("is_complete"):
     print("Du 100 epoch -> chay danh gia cuoi + sinh bao cao")
-    rc_eval = os.system(f"python -m src.evaluate --config {CFG_PATH} 2>&1")
+    rc_eval = os.system(f"python -m src.evaluate --config {CFG_PATH}{VARIANT_ARG} 2>&1")
     print(f"evaluate exit code = {rc_eval}")
     if rc_eval == 0:
         bucket, prefix = os.environ["S3_BUCKET"], os.environ["S3_PREFIX"]
@@ -269,7 +275,7 @@ else:
 
 md("## 8. Trang thai SAU khi chay")
 
-code('''run_id = RunRegistry(store).get()
+code('''run_id = REGISTRY.get()
 st = store.get_json_or_none(f"{run_id}/checkpoints/training_state.json") or {}
 hist = store.get_json_or_none(f"{run_id}/metrics/history.json") or []
 
@@ -297,7 +303,7 @@ print("=" * 62)''')
 
 
 # ============================================================== xuat file
-def build(credentials_b64: str = "") -> dict:
+def build(credentials_b64: str = "", variant: str = "") -> dict:
     cells = []
     for kind, text in CELLS:
         source = text.rstrip("\n").split("\n")
@@ -307,10 +313,11 @@ def build(credentials_b64: str = "") -> dict:
         else:
             cells.append({"cell_type": "code", "execution_count": None,
                           "metadata": {}, "outputs": [], "source": source})
-    if credentials_b64:
-        for c in cells:
-            c["source"] = [s.replace("__MDDCC_CREDENTIALS_B64__", credentials_b64)
-                           for s in c["source"]]
+    for token, value in (("__MDDCC_CREDENTIALS_B64__", credentials_b64),
+                         ("__MDDCC_VARIANT__", variant)):
+        if value:
+            for c in cells:
+                c["source"] = [s.replace(token, value) for s in c["source"]]
     return {
         "cells": cells,
         "metadata": {

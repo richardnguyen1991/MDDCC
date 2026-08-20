@@ -3,11 +3,15 @@ name: run-kaggle
 # Muc 8.B. Workflow nay CHI doc/ghi S3 va goi Kaggle API - KHONG train tren
 # runner cua GitHub.
 #
+# Hai bien the chay SONG SONG va doc lap:
+#   full       - 70.4M hang, ~39 session, ~20 ngay
+#   capped10m  - ~10M hang chan tran, ~6 session, ~3 ngay
+# Moi bien the co run_id rieng, kernel Kaggle rieng, cache rieng, khoa
+# current_run_id.json rieng. Chung khong dung cham gi nhau.
+#
 # Luu y ve cron:
 #   * GitHub tu tat cron sau 60 ngay repo khong hoat dong.
 #   * Cron chay "best effort", co the tre vai phut.
-# Voi ngan sach ~39 session x 11h20m, hai dieu nay khong gay van de: chi can
-# workflow bat duoc thoi diem kernel vua ket thuc.
 
 on:
   schedule:
@@ -18,11 +22,11 @@ on:
         description: "Chi quyet dinh, khong push kernel"
         type: boolean
         default: false
-
-# Khong de hai lan push chong nhau
-concurrency:
-  group: mddcc-kaggle
-  cancel-in-progress: false
+      only_variant:
+        description: "Chi chay mot bien the (de trong = ca hai)"
+        type: choice
+        default: ""
+        options: ["", "full", "capped10m"]
 
 permissions:
   contents: read
@@ -32,6 +36,19 @@ jobs:
   orchestrate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    strategy:
+      # Mot bien the hong khong duoc keo bien the kia dung theo
+      fail-fast: false
+      matrix:
+        variant: [full, capped10m]
+
+    # Khoa theo TUNG bien the. Neu khoa chung thi hai bien the phai xep hang
+    # cho nhau vo ich, trong khi chung chay tren hai kernel Kaggle khac nhau.
+    concurrency:
+      group: mddcc-kaggle-${{ matrix.variant }}
+      cancel-in-progress: false
+
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -40,17 +57,33 @@ jobs:
       S3_PREFIX: ${{ secrets.S3_PREFIX }}
       KAGGLE_KERNEL: ${{ secrets.KAGGLE_KERNEL }}
       MAX_RESTARTS: "60"
+      VARIANT: ${{ matrix.variant }}
       # 16 gio: du cho session 11h20m cong thoi gian Kaggle xep hang
       STS_DURATION_SECONDS: "57600"
 
     steps:
+      - name: Chon bien the
+        id: gate
+        run: |
+          only="${{ inputs.only_variant }}"
+          if [ -n "$only" ] && [ "$only" != "$VARIANT" ]; then
+            echo "Bo qua bien the $VARIANT (lan nay chi chay '$only')"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Chay bien the $VARIANT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.skip != 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.skip != 'true'
         with:
           python-version: "3.11"
 
       - name: Kiem tra secrets bat buoc
+        if: steps.gate.outputs.skip != 'true'
         run: |
           missing=""
           for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION \
@@ -64,11 +97,13 @@ jobs:
           echo "Du 6 secret."
 
       - name: Cai kaggle + boto3
+        if: steps.gate.outputs.skip != 'true'
         run: pip install --quiet kaggle boto3 PyYAML
 
       # KAGGLE_API_TOKEN co the la chuoi key thuan HOAC toan bo noi dung
       # kaggle.json - phai tu nhan dang ca hai dang (muc 8.A).
       - name: Dung ~/.kaggle/kaggle.json
+        if: steps.gate.outputs.skip != 'true'
         env:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
@@ -106,17 +141,24 @@ jobs:
       # commit KHONG bao gio bi ghi vao.
       - name: Dung kernel co credential tam thoi
         id: prepare
+        if: steps.gate.outputs.skip != 'true'
         run: |
           python scripts/prepare_kernel_push.py \
             --out-dir "${RUNNER_TEMP}/kernel_push" \
+            --variant "$VARIANT" \
             --duration "$STS_DURATION_SECONDS"
+          slug=$(python -c "import json,os,sys; print(json.load(open(os.environ['RUNNER_TEMP'] + '/kernel_push/kernel-metadata.json'))['id'])")
+          echo "Kernel cua bien the $VARIANT: $slug"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
 
       - name: Dieu phoi (quyet dinh + push neu can)
         id: orchestrate
+        if: steps.gate.outputs.skip != 'true'
         run: |
           python scripts/kaggle_orchestrator.py \
-            --kernel "$KAGGLE_KERNEL" \
+            --kernel "${{ steps.prepare.outputs.slug }}" \
             --kernel-dir "${RUNNER_TEMP}/kernel_push" \
+            --variant "$VARIANT" \
             --max-restarts "$MAX_RESTARTS" \
             ${{ inputs.dry_run && '--dry-run' || '' }}
 
@@ -132,18 +174,22 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const variant = "${{ matrix.variant }}";
+            const label = "mddcc-orchestration-" + variant;
             const reason = ${{ toJSON(steps.orchestrate.outputs.abort_reason) }};
-            const title = "MDDCC: tu dong khoi dong lai da bi dung";
+            const title = "MDDCC [" + variant + "]: tu dong khoi dong lai da bi dung";
             const existing = await github.rest.issues.listForRepo({
               owner: context.repo.owner, repo: context.repo.repo,
-              state: "open", labels: "mddcc-orchestration",
+              state: "open", labels: label,
             });
             const body = [
-              "Orchestrator da dung viec tu dong khoi dong lai kernel Kaggle.",
+              "Orchestrator da dung viec tu dong khoi dong lai kernel Kaggle",
+              "cho bien the **" + variant + "**.",
               "",
               "**Ly do:** " + reason,
               "",
-              "`training_state.json` tren S3 da duoc dat `status=failed`.",
+              "`training_state.json` cua bien the nay da duoc dat `status=failed`.",
+              "Bien the con lai KHONG bi anh huong.",
               "",
               "### Can kiem tra",
               "1. Log cua kernel tren Kaggle - notebook chet o buoc nao?",
@@ -158,7 +204,8 @@ jobs:
               "",
               "### Chay lai sau khi sua",
               "Sua nguyen nhan, dat lai `status` trong `training_state.json`",
-              "thanh `interrupted`, roi chay workflow bang **Run workflow**.",
+              "thanh `interrupted`, roi chay workflow bang **Run workflow** voi",
+              "`only_variant = " + variant + "`.",
               "",
               "_Workflow run: " + context.serverUrl + "/" + context.repo.owner +
                 "/" + context.repo.repo + "/actions/runs/" + context.runId + "_",
@@ -173,7 +220,7 @@ jobs:
             } else {
               const issue = await github.rest.issues.create({
                 owner: context.repo.owner, repo: context.repo.repo,
-                title, body, labels: ["mddcc-orchestration"],
+                title, body, labels: ["mddcc-orchestration", label],
               });
               core.warning("Da mo Issue #" + issue.data.number);
             }
@@ -181,8 +228,6 @@ jobs:
       - name: Tom tat
         if: always()
         run: |
-          echo "### MDDCC orchestration" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Kernel: \`$KAGGLE_KERNEL\`" >> $GITHUB_STEP_SUMMARY
+          echo "### MDDCC orchestration - bien the \`$VARIANT\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Xem log cua step **Dieu phoi** de biet quyet dinh." >> $GITHUB_STEP_SUMMARY

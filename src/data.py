@@ -303,6 +303,96 @@ class Splits:
         return {"train": self.train.size, "val": self.val.size, "test": self.test.size}
 
 
+# ---------------------------------------------------- lay mau con (tuy chon)
+def class_cap_for_target(counts: np.ndarray, target: int) -> int:
+    """Tim tran c nho nhat sao cho sum(min(count_i, c)) >= target.
+
+    Lop it hon tran duoc giu TRON VEN; chi lop lon bi chan. Nho vay WebDDoS
+    (439 mau) khong bi cat trong khi TFTP (20M) bi ha xuong.
+    """
+    counts = np.asarray(counts, dtype=np.int64)
+    if counts.sum() <= target:
+        return int(counts.max())
+    lo, hi = 1, int(counts.max())
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if np.minimum(counts, mid).sum() < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    return int(lo)
+
+
+def subsample_indices(labels: LabelIndex, cfg: dict) -> tuple[np.ndarray | None, dict]:
+    """Chon tap con hang de huan luyen. Tra ve (chi so toan cuc da sort, thong tin).
+
+    mode:
+      none        - giu tron du lieu (mac dinh, dung bai bao nhat)
+      proportional- giu nguyen ty le lop; lop hiem gan nhu bien mat
+      capped      - giu TRON lop hiem, chan tran lop lon; giu duoc Macro-F1 co
+                    y nghia nhung DA CAN THIEP vao phan bo lop -> phai ghi vao
+                    deviations_from_paper
+    """
+    scfg = (cfg.get("data", {}) or {}).get("subsample") or {}
+    mode = scfg.get("mode", "none")
+    if mode == "none":
+        return None, {"mode": "none", "n_rows": int(labels.codes.size)}
+
+    target = int(scfg.get("target_rows", 0))
+    if target <= 0 or target >= labels.codes.size:
+        return None, {"mode": "none", "n_rows": int(labels.codes.size),
+                      "note": f"target_rows={target} >= tong so hang, bo qua"}
+
+    rng = np.random.default_rng(scfg.get("seed", cfg["experiment"]["seed"]))
+    counts = np.bincount(labels.codes, minlength=labels.num_classes)
+    chosen, per_class = [], {}
+
+    if mode == "capped":
+        cap = class_cap_for_target(counts, target)
+        for c in range(labels.num_classes):
+            pool = np.flatnonzero(labels.codes == c)
+            take = min(pool.size, cap)
+            chosen.append(rng.choice(pool, size=take, replace=False)
+                          if take < pool.size else pool)
+            per_class[labels.classes[c]] = int(take)
+        info_extra = {"cap_per_class": int(cap)}
+    elif mode == "proportional":
+        frac = target / labels.codes.size
+        for c in range(labels.num_classes):
+            pool = np.flatnonzero(labels.codes == c)
+            take = max(1, int(round(pool.size * frac)))
+            take = min(take, pool.size)
+            chosen.append(rng.choice(pool, size=take, replace=False)
+                          if take < pool.size else pool)
+            per_class[labels.classes[c]] = int(take)
+        info_extra = {"fraction": frac}
+    else:
+        raise ValueError(f"data.subsample.mode khong hop le: {mode!r}")
+
+    selected = np.sort(np.concatenate(chosen)).astype(np.int64)
+    kept_whole = [labels.classes[c] for c in range(labels.num_classes)
+                  if per_class[labels.classes[c]] == int(counts[c])]
+    info = {
+        "mode": mode,
+        "target_rows": target,
+        "n_rows": int(selected.size),
+        "n_rows_before": int(labels.codes.size),
+        "seed": int(scfg.get("seed", cfg["experiment"]["seed"])),
+        "per_class_after": per_class,
+        "per_class_before": {labels.classes[c]: int(counts[c])
+                             for c in range(labels.num_classes)},
+        "classes_kept_whole": kept_whole,
+        **info_extra,
+        "warning": ("Lay mau chan tran DA CAN THIEP vao phan bo lop tu nhien, "
+                    "khac voi imbalance_handling=none. FPR va binary view khong "
+                    "con so truc tiep duoc voi Table 9.") if mode == "capped" else "",
+    }
+    LOG.info("Lay mau con [%s]: %d -> %d hang%s", mode, labels.codes.size,
+             selected.size,
+             f", tran {info_extra.get('cap_per_class'):,}/lop" if mode == "capped" else "")
+    return selected, info
+
+
 def make_splits(labels: LabelIndex, cfg: dict,
                 groups: np.ndarray | None = None) -> Splits:
     """Stratified split 59.5 / 10.5 / 30 - muc 3.D. Split TRUOC moi bien doi."""
@@ -506,11 +596,17 @@ def iter_row_groups(fp: Path, columns: Sequence[str]) -> Iterator[np.ndarray]:
 
 
 def fit_scaler_on_train(files: Sequence[Path], row_counts: Sequence[int],
-                        schema: FeatureSchema, splits: Splits) -> ScalerStats:
-    """Pass 1: thong ke min/max/mean CHI tren hang thuoc tap train (muc 3.C.4)."""
+                        schema: FeatureSchema, train_rows) -> ScalerStats:
+    """Pass 1: thong ke min/max/mean CHI tren hang thuoc tap train (muc 3.C.4).
+
+    train_rows la chi so hang TOAN CUC (khong phai chi so trong cache), hoac mot
+    Splits khi khong lay mau con.
+    """
     stats = ColumnStats(schema.n_features)
+    if isinstance(train_rows, Splits):
+        train_rows = train_rows.train
     train_mask_all = np.zeros(int(sum(row_counts)), dtype=bool)
-    train_mask_all[splits.train] = True
+    train_mask_all[np.asarray(train_rows, dtype=np.int64)] = True
 
     offset = 0
     for fp, n_rows in zip(files, row_counts):
@@ -541,14 +637,17 @@ class ColumnSelection:
 
 
 def read_train_sample(files: Sequence[Path], row_counts: Sequence[int],
-                      schema: FeatureSchema, splits: Splits,
+                      schema: FeatureSchema, train_rows,
                       max_rows: int = 50_000) -> np.ndarray:
     """Doc mot mau hang thuoc tap train de doi chieu cot trung lap.
 
+    train_rows la chi so hang TOAN CUC (hoac Splits khi khong lay mau con).
     Chi doc du max_rows roi dung - khong quet het 70.4M hang.
     """
+    if isinstance(train_rows, Splits):
+        train_rows = train_rows.train
     train_mask = np.zeros(int(sum(row_counts)), dtype=bool)
-    train_mask[splits.train] = True
+    train_mask[np.asarray(train_rows, dtype=np.int64)] = True
 
     chunks, taken, offset = [], 0, 0
     for fp in files:
@@ -627,30 +726,54 @@ def select_columns(schema: FeatureSchema, scaler: ScalerStats, cfg: dict,
 
 def build_feature_cache(files: Sequence[Path], row_counts: Sequence[int],
                         schema: FeatureSchema, scaler: ScalerStats,
-                        cache_path: Path) -> tuple[np.memmap, float]:
-    """Pass 2: impute + Min-Max -> memmap float32 [N, F]. Tra ve (memmap, giay)."""
-    total = int(sum(row_counts))
+                        cache_path: Path,
+                        selected: np.ndarray | None = None
+                        ) -> tuple[np.memmap, float]:
+    """Pass 2: impute + Min-Max -> memmap float32 [N, F]. Tra ve (memmap, giay).
+
+    selected: chi so hang TOAN CUC da sort, chi nhung hang nay duoc ghi vao cache.
+    Hang thu k cua cache ung voi hang toan cuc selected[k]. Nho vay bien the lay
+    mau con khong phai dung cache cho ca 70.4M hang.
+    """
+    total_rows = int(sum(row_counts))
+    if selected is None:
+        keep = None
+        n_out = total_rows
+    else:
+        keep = np.zeros(total_rows, dtype=bool)
+        keep[np.asarray(selected, dtype=np.int64)] = True
+        n_out = int(keep.sum())
+
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
     mm = np.lib.format.open_memmap(cache_path, mode="w+", dtype=np.float32,
-                                   shape=(total, schema.n_features))
-    offset = 0
+                                   shape=(n_out, schema.n_features))
+    read_at = write_at = 0
     for fp in files:
         for block in iter_row_groups(fp, schema.feature_columns):
             n = block.shape[0]
-            mm[offset:offset + n] = scaler.transform(block)
-            offset += n
-        LOG.info("  cache: %s -> %d/%d hang", fp.name, offset, total)
+            if keep is None:
+                mm[write_at:write_at + n] = scaler.transform(block)
+                write_at += n
+            else:
+                m = keep[read_at:read_at + n]
+                if m.any():
+                    sub = scaler.transform(block[m])
+                    mm[write_at:write_at + sub.shape[0]] = sub
+                    write_at += sub.shape[0]
+            read_at += n
+        LOG.info("  cache: %s -> %d/%d hang", fp.name, write_at, n_out)
     mm.flush()
-    if offset != total:
-        raise RuntimeError(f"Ghi {offset} hang, mong doi {total}")
+    if write_at != n_out:
+        raise RuntimeError(f"Ghi {write_at} hang, mong doi {n_out}")
     return mm, time.perf_counter() - t0
 
 
 # ------------------------------------------------------------------ manifest
 def build_cache_manifest(schema: FeatureSchema, scaler: ScalerStats,
                          geom, row_counts: Sequence[int], files: Sequence[Path],
-                         cache_build_seconds: float) -> dict:
+                         cache_build_seconds: float,
+                         n_rows_cached: int | None = None) -> dict:
     """cache_manifest.json - phien sau xac minh cache dung lai khop hệt (muc 3.A)."""
     from .wavelet import geometry_hash
     return {
@@ -658,7 +781,8 @@ def build_cache_manifest(schema: FeatureSchema, scaler: ScalerStats,
         "scaler_hash": scaler.hash,
         "wavelet_geometry_hash": geometry_hash(geom, schema.feature_columns),
         "wavelet_geometry": geom.to_dict(),
-        "n_rows": int(sum(row_counts)),
+        "n_rows": int(n_rows_cached if n_rows_cached is not None else sum(row_counts)),
+        "n_rows_in_dataset": int(sum(row_counts)),
         "n_features": schema.n_features,
         "files": [{"name": f.name, "rows": int(n)} for f, n in zip(files, row_counts)],
         "cache_layout": "feature_cache.npy = float32 [N, F] da Min-Max; "
@@ -797,14 +921,28 @@ def prepare_dataset(cfg: dict, out_dir: Path, *, files=None) -> PreparedData:
             for f in files
         ])
 
+    # Lay mau con TRUOC khi chia tap, de phan tang tinh tren dung tap se dung.
+    # Sau buoc nay moi thu lam viec trong "khong gian cache": hang thu k cua cache
+    # ung voi hang toan cuc selected[k].
+    selected, subsample_info = subsample_indices(labels, cfg)
+    labels_full = labels
+    if selected is not None:
+        labels = LabelIndex(labels.classes, labels.codes[selected],
+                            labels.benign_class, labels.merge_map, labels.raw_counts)
+        if groups is not None:
+            groups = groups[selected]
+
+    def to_global(rows: np.ndarray) -> np.ndarray:
+        return rows if selected is None else selected[np.asarray(rows, dtype=np.int64)]
+
     splits = make_splits(labels, cfg, groups=groups)
     manifest = assert_no_leakage(splits, labels.codes.size)
 
     # Fit scaler tren train, roi moi loai cot - vi tieu chi loai (missing/hang so/
     # trung lap) deu phai tinh CHI tren tap train. Min-Max doc lap tung cot nen
     # cat bot cot khong lam sai thong ke, khong can fit lai.
-    scaler_full = fit_scaler_on_train(files, rc, schema, splits)
-    sample = read_train_sample(files, rc, schema, splits)
+    scaler_full = fit_scaler_on_train(files, rc, schema, to_global(splits.train))
+    sample = read_train_sample(files, rc, schema, to_global(splits.train))
     selection = select_columns(schema, scaler_full, cfg, sample)
     del sample
 
@@ -817,7 +955,8 @@ def prepare_dataset(cfg: dict, out_dir: Path, *, files=None) -> PreparedData:
     geom = geometry_from_config(schema.n_features, cfg)
 
     cache_path = Path(dcfg["cache_dir"]) / "feature_cache.npy"
-    _, secs = build_feature_cache(files, rc, schema, scaler, cache_path)
+    _, secs = build_feature_cache(files, rc, schema, scaler, cache_path,
+                                  selected=selected)
 
     per_split_counts = {
         name: {labels.classes[c]: int((labels.codes[idx] == c).sum())
@@ -827,7 +966,9 @@ def prepare_dataset(cfg: dict, out_dir: Path, *, files=None) -> PreparedData:
     artifacts = {
         "feature_schema.json": schema.to_dict(),
         "label_mapping.json": labels.to_dict(),
-        "sample_manifest.json": {**manifest, "per_split_class_counts": per_split_counts},
+        "sample_manifest.json": {**manifest,
+                                 "per_split_class_counts": per_split_counts,
+                                 "subsample": subsample_info},
         "scaler_stats.json": scaler.to_dict(),
         "preprocessing.json": {
             "order": cfg["preprocessing"]["order"],
@@ -855,15 +996,19 @@ def prepare_dataset(cfg: dict, out_dir: Path, *, files=None) -> PreparedData:
         "data_profile.json": {
             "input_dir": str(input_dir),
             "files": [{"name": f.name, "rows": int(n)} for f, n in zip(files, rc)],
-            "total_rows": int(sum(rc)),
+            "total_rows_in_dataset": int(sum(rc)),
+            "total_rows": int(labels.codes.size),
+            "subsample": subsample_info,
             "n_features": schema.n_features,
             "num_class": labels.num_classes,
             "class_counts": labels.counts(),
             "split_sizes": splits.sizes(),
-            "cache_bytes": int(sum(rc) * schema.n_features * 4),
+            "cache_bytes": int(labels.codes.size * schema.n_features * 4),
             "cache_build_seconds": round(secs, 2),
         },
-        "cache_manifest.json": build_cache_manifest(schema, scaler, geom, rc, files, secs),
+        "cache_manifest.json": build_cache_manifest(
+            schema, scaler, geom, rc, files, secs,
+            n_rows_cached=int(labels.codes.size)),
     }
     for name, payload in artifacts.items():
         (out_dir / name).write_text(

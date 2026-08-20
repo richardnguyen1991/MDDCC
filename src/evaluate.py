@@ -343,7 +343,9 @@ def run_evaluation(cfg: dict, *, local_store_root=None, run_id: str | None = Non
 
     torch.set_num_threads(int(cfg["train"].get("torch_num_threads", 4)))
     store = store_from_env(cfg, local_root=local_store_root)
-    run_id = run_id or RunRegistry(store).get()
+    from .config import run_id_key
+
+    run_id = run_id or RunRegistry(store, key=run_id_key(cfg)).get()
     if not run_id:
         raise RuntimeError("Khong tim thay current_run_id.json - chua co run nao")
     writer = SafeWriter(store)
@@ -494,6 +496,7 @@ def main(argv=None) -> int:
 
     ap = argparse.ArgumentParser(description="Buoc danh gia cuoi MDDCC")
     ap.add_argument("--config", type=Path, required=True)
+    ap.add_argument("--variant", default=None)
     ap.add_argument("--input-dir", type=Path, default=None)
     ap.add_argument("--cache-dir", type=Path, default=None)
     ap.add_argument("--local-store", type=Path, default=None)
@@ -506,7 +509,9 @@ def main(argv=None) -> int:
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)-7s %(message)s",
                         datefmt="%H:%M:%S", stream=sys.stdout)
-    cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    from .config import load_config
+
+    cfg = load_config(args.config, args.variant)
     if args.input_dir:
         cfg["data"]["kaggle_input_dir"] = str(args.input_dir)
     if args.cache_dir:
